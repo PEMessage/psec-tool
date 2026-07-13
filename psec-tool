@@ -33,6 +33,31 @@ def cmd_tr31_unwrap(args: argparse.Namespace) -> None:
     print(f"key: {key.hex().upper()}")
 
 
+_KBPK_VERSIONS = [
+    ("A", "TDES Key Variant Binding Method", "_c_derive"),
+    ("B", "TDES Key Derivation Binding Method", "_b_derive"),
+    ("C", "TDES Key Variant Binding Method", "_c_derive"),
+    ("D", "AES Key Derivation Binding Method", "_d_derive"),
+]
+
+
+def cmd_tr31_kbpk(args: argparse.Namespace) -> None:
+    kbpk = bytes.fromhex(args.kbpk)
+    print(f"kbpk: {kbpk.hex().upper()} ({len(kbpk)} bytes)")
+    for version_id, description, method in _KBPK_VERSIONS:
+        print(f"version {version_id} ({description}):")
+        kb = psec.tr31.KeyBlock(
+            kbpk=kbpk, header=psec.tr31.Header(version_id=version_id)
+        )
+        try:
+            kbek, kbak = getattr(kb, method)()
+        except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
+            print(f"  n/a: {e}")
+            continue
+        print(f"  kbek: {kbek.hex().upper()}")
+        print(f"  kbak: {kbak.hex().upper()}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psec-tool",
@@ -45,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     unwrap = tr31_sub.add_parser("unwrap", help="Unwrap a key from a TR-31 key block.")
     unwrap.add_argument(
+        "-k",
         "--kbpk",
         required=True,
         help="Key Block Protection Key as a hex string.",
@@ -54,6 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="TR-31 key block string to unwrap.",
     )
     unwrap.set_defaults(func=cmd_tr31_unwrap)
+
+    kbpk = tr31_sub.add_parser(
+        "kbpk",
+        help="Print derived intermediate keys (KBEK/KBAK) for all versions.",
+    )
+    kbpk.add_argument(
+        "-k",
+        "--kbpk",
+        required=True,
+        help="Key Block Protection Key as a hex string.",
+    )
+    kbpk.set_defaults(func=cmd_tr31_kbpk)
 
     return parser
 
