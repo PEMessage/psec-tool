@@ -17,9 +17,7 @@ warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 import psec
 
 
-def cmd_tr31_unwrap(args: argparse.Namespace) -> None:
-    kbpk = bytes.fromhex(args.kbpk)
-    header, key = psec.tr31.unwrap(kbpk=kbpk, key_block=args.key_block)
+def _print_header(header: "psec.tr31.Header") -> None:
     print(f"header: {header}")
     print(f"  version_id:    {header.version_id}")
     print(f"  key_usage:     {header.key_usage}")
@@ -30,6 +28,18 @@ def cmd_tr31_unwrap(args: argparse.Namespace) -> None:
     print(f"  blocks:        {len(header.blocks)}")
     for block_id, block_data in header.blocks.items():
         print(f"    block[{block_id}]:   {block_data}")
+
+
+def cmd_tr31_unwrap(args: argparse.Namespace) -> None:
+    if args.kbpk is None:
+        header = psec.tr31.Header()
+        header.load(args.key_block)
+        _print_header(header)
+        return
+
+    kbpk = bytes.fromhex(args.kbpk)
+    header, key = psec.tr31.unwrap(kbpk=kbpk, key_block=args.key_block)
+    _print_header(header)
     print(f"key: {key.hex().upper()}")
 
 
@@ -72,8 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     unwrap.add_argument(
         "-k",
         "--kbpk",
-        required=True,
-        help="Key Block Protection Key as a hex string.",
+        help="Key Block Protection Key as a hex string. "
+        "If omitted, only the header is parsed (no decryption or MAC check).",
     )
     unwrap.add_argument(
         "key_block",
