@@ -3,14 +3,69 @@
 # requires-python = ">=3.9"
 # dependencies = [
 #     "psec",
+#     "cryptography",
 # ]
 # ///
+import argparse
+import sys
+import warnings
+
+from cryptography.utils import CryptographyDeprecationWarning
+
+warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+
 import psec
 
 
+def cmd_tr31_unwrap(args: argparse.Namespace) -> None:
+    kbpk = bytes.fromhex(args.kbpk)
+    header, key = psec.tr31.unwrap(kbpk=kbpk, key_block=args.key_block)
+    print(f"header: {header}")
+    print(f"  version_id:    {header.version_id}")
+    print(f"  key_usage:     {header.key_usage}")
+    print(f"  algorithm:     {header.algorithm}")
+    print(f"  mode_of_use:   {header.mode_of_use}")
+    print(f"  version_num:   {header.version_num}")
+    print(f"  exportability: {header.exportability}")
+    print(f"  blocks:        {len(header.blocks)}")
+    for block_id, block_data in header.blocks.items():
+        print(f"    block[{block_id}]:   {block_data}")
+    print(f"key: {key.hex().upper()}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="psec-tool",
+        description="CLI over the psec payment-security library.",
+    )
+    subcmds = parser.add_subparsers(dest="command", required=True)
+
+    tr31 = subcmds.add_parser("tr31", help="TR-31 key block operations.")
+    tr31_sub = tr31.add_subparsers(dest="tr31_command", required=True)
+
+    unwrap = tr31_sub.add_parser("unwrap", help="Unwrap a key from a TR-31 key block.")
+    unwrap.add_argument(
+        "--kbpk",
+        required=True,
+        help="Key Block Protection Key as a hex string.",
+    )
+    unwrap.add_argument(
+        "key_block",
+        help="TR-31 key block string to unwrap.",
+    )
+    unwrap.set_defaults(func=cmd_tr31_unwrap)
+
+    return parser
+
+
 def main() -> None:
-    print("hello world")
-    print(f"psec loaded from: {psec.__path__}")
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except (ValueError, psec.tr31.KeyBlockError, psec.tr31.HeaderError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
