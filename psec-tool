@@ -1,0 +1,19 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "psec",
+# ]
+# ///
+import psec
+
+
+def main() -> None:
+    print("hello world")
+    print(f"psec loaded from: {psec.__path__}")
+
+
+if __name__ == "__main__":
+    main()
+
+# vim: ft=python
