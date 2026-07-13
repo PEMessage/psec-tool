@@ -68,6 +68,48 @@ def cmd_tr31_kbpk(args: argparse.Namespace) -> None:
         print(f"  kbak: {kbak.hex().upper()}")
 
 
+def cmd_tr31_cmac_k1k2(args: argparse.Namespace) -> None:
+    # CMAC subkeys K1/K2 (NIST SP 800-38B). These are a low-level primitive:
+    # K1/K2 = shift-left-1 of E_K(0), conditionally XOR'd with Rb
+    # (Rb = ...1B for DES 8-byte blocks, ...87 for AES 16-byte blocks).
+    #
+    # These subkeys are NOT the KBEK/KBAK themselves; they are a building
+    # block used *inside* the KBEK/KBAK derivation (see `tr31 kbpk`):
+    #
+    #   Version B (TDES) / D (AES) key derivation:
+    #     1. Derive CMAC subkeys from the KBPK:
+    #          DES: K1, _ = _derive_des_cmac_subkey(kbpk)   (uses K1)
+    #          AES: _, K2 = _derive_aes_cmac_subkey(kbpk)   (uses K2)
+    #     2. Build a derivation input block carrying:
+    #          counter | usage (0000=enc / 0001=mac) | 00 | algo | key-bits
+    #     3. XOR that input with the subkey (K1 for DES, K2 for AES) and
+    #        run it through CBC-MAC under the KBPK. Each pass yields 64 bits
+    #        (DES) or 128 bits (AES) of keying material.
+    #     4. Concatenate passes (incrementing the counter) until enough bits:
+    #          usage=0000 -> KBEK (encryption key)
+    #          usage=0001 -> KBAK (authentication key)
+    #
+    #   The KBAK is then itself fed through the CMAC-subkey step again when
+    #   generating the final key-block MAC (the last block is XOR'd with K1
+    #   of the KBAK before the CBC-MAC pass).
+    #
+    #   Version A/C do NOT use CMAC subkeys at all; they derive KBEK/KBAK by
+    #   XOR'ing the KBPK with the constants 0x45.. / 0x4D.. (variant method).
+    key = bytes.fromhex(args.key)
+    print(f"key: {key.hex().upper()} ({len(key)} bytes)")
+    kb = psec.tr31.KeyBlock(kbpk=b"\x00" * 16)
+    for algorithm, method in (("DES", "_derive_des_cmac_subkey"),
+                              ("AES", "_derive_aes_cmac_subkey")):
+        print(f"{algorithm}:")
+        try:
+            k1, k2 = getattr(kb, method)(key)
+        except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
+            print(f"  n/a: {e}")
+            continue
+        print(f"  k1: {k1.hex().upper()}")
+        print(f"  k2: {k2.hex().upper()}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psec-tool",
@@ -102,6 +144,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Key Block Protection Key as a hex string.",
     )
     kbpk.set_defaults(func=cmd_tr31_kbpk)
+
+    cmac_k1k2 = tr31_sub.add_parser(
+        "cmac-k1k2",
+        help="Derive CMAC subkeys K1/K2 from a key (building block of KBEK/KBAK).",
+    )
+    cmac_k1k2.add_argument(
+        "key",
+        help="Key as a hex string.",
+    )
+    cmac_k1k2.set_defaults(func=cmd_tr31_cmac_k1k2)
 
     return parser
 
