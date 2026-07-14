@@ -393,14 +393,17 @@ def cmd_tr31_derive_data(args: argparse.Namespace) -> None:
 # manual KBEK/KBAK derivation (composed from cmac-k1k2 + derive-data)
 # ---------------------------------------------------------------------------
 
-def _derive_bde_pass(kbpk: bytes, block: DeriveDataBlock, subkey_hex: str) -> str:
+def _derive_bde_pass(
+    kbpk: bytes, cipher: str, data_hex: str, block_size: int, subkey_hex: str,
+) -> str:
     from psec import mac as _psec_mac, tools as _psec_tools
 
-    algorithm = psec.mac.Algorithm.DES if block.ver.cipher == "TDES" else psec.mac.Algorithm.AES
-    kd = bytes.fromhex(block.data_hex)
+    kd = bytes.fromhex(data_hex)
     xor_data = _psec_tools.xor(kd, bytes.fromhex(subkey_hex))
+
+    algorithm = psec.mac.Algorithm.DES if cipher == "TDES" else psec.mac.Algorithm.AES
     return _psec_mac.generate_cbc_mac(
-        kbpk, xor_data, 1, block.ver.block_size, algorithm,
+        kbpk, xor_data, 1, block_size, algorithm,
     ).hex().upper()
 
 
@@ -414,12 +417,12 @@ class ConDeriveTrace(KbpkRow):
 
 def do_tr31_kbek_kbak_ver_cmac(kbpk: bytes) -> list[ConDeriveTrace]:
     blocks = [b for b in do_tr31_derive_data() if b.cfg.kbpk_bytes == len(kbpk)]
-    cmac = {r.algorithm: r for r in do_tr31_cmac_k1k2(kbpk)}
+    cmac = {r.algorithm: (r.k1, r.k2) for r in do_tr31_cmac_k1k2(kbpk)}
 
     acc: dict[tuple[str, int], ConDeriveTrace] = {}
     for b in blocks:
         key = (b.ver.version_id, b.cfg.kbpk_bytes)
-        subkey_hex = cmac["DES"].k1 if b.ver.subkey == "K1" else cmac["AES"].k2
+        subkey_hex = cmac["DES"][0] if b.ver.subkey == "K1" else cmac["AES"][1]
         if key not in acc:
             acc[key] = ConDeriveTrace(
                 version_id=b.ver.version_id,
@@ -427,7 +430,7 @@ def do_tr31_kbek_kbak_ver_cmac(kbpk: bytes) -> list[ConDeriveTrace]:
                 subkey_name=b.ver.subkey,
                 subkey_hex=subkey_hex,
             )
-        pass_hex = _derive_bde_pass(kbpk, b, subkey_hex)
+        pass_hex = _derive_bde_pass(kbpk, b.ver.cipher, b.data_hex, b.ver.block_size, subkey_hex)
         xor_hex = psec.tools.xor(
             bytes.fromhex(b.data_hex), bytes.fromhex(subkey_hex),
         ).hex().upper()
