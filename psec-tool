@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.9"
 # dependencies = [
-#     "psec",
+#     "psec @ git+https://github.com/PEMessage/psec@1ec6663bccc27f26be707a48f292377c2ecc51f2",
 #     "cryptography",
 # ]
 # ///
@@ -48,6 +48,7 @@ _KBPK_VERSIONS = [
     ("B", "TDES Key Derivation Binding Method", "_b_derive"),
     ("C", "TDES Key Variant Binding Method", "_c_derive"),
     ("D", "AES Key Derivation Binding Method", "_d_derive"),
+    ("E", "AES Key Derivation Binding Method", "_e_derive"),
 ]
 
 
