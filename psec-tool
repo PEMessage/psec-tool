@@ -304,13 +304,16 @@ _DERIVE_DATA: list[DeriveVersion] = [
 
 def _build_derive_data_block(
     block_size: int, counter: int, usage: str, algo: str, keybits: str
-) -> str:
-    b = bytearray(block_size)
+) -> bytes:
+    if block_size == 8:
+        b = bytearray(bytes.fromhex("0100000000000080"))
+    else:
+        b = bytearray(bytes.fromhex("01000000000200808000000000000000"))
     b[0] = counter
     b[1:3] = bytes.fromhex(usage)
     b[4:6] = bytes.fromhex(algo)
     b[6:8] = bytes.fromhex(keybits)
-    return b.hex().upper()
+    return bytes(b)
 
 
 @dataclass
@@ -331,7 +334,7 @@ def do_tr31_derive_data() -> list[DeriveDataBlock]:
                                                 ("mac", v.usage_mac)]:
                     data = _build_derive_data_block(
                         v.block_size, counter, usage_hex, cfg.algo, cfg.keybits
-                    )
+                    ).hex().upper()
                     rows.append(
                         DeriveDataBlock(
                             ver=v,
@@ -361,6 +364,112 @@ def cmd_tr31_derive_data(args: argparse.Namespace) -> None:
             f"=> {r.data_hex}"
         )
         prev_cfg = r.cfg
+
+
+def _derive_bde_one(kbpk: bytes, block: DeriveDataBlock, subkey_hex: str) -> str:
+    from psec import mac as _psec_mac, tools as _psec_tools
+
+    algorithm = psec.mac.Algorithm.DES if block.ver.cipher == "TDES" else psec.mac.Algorithm.AES
+    kd = bytes.fromhex(block.data_hex)
+    xor_data = _psec_tools.xor(kd, bytes.fromhex(subkey_hex))
+    return _psec_mac.generate_cbc_mac(
+        kbpk, xor_data, 1, block.ver.block_size, algorithm,
+    ).hex().upper()
+
+
+def do_tr31_kbek_kbak_ver_bde(kbpk: bytes) -> list[KbpkRow]:
+    from collections import defaultdict
+
+    blocks = [b for b in do_tr31_derive_data() if b.cfg.kbpk_bytes == len(kbpk)]
+    cmac = {r.algorithm: r for r in do_tr31_cmac_k1k2(kbpk)}
+    ver_desc = {vid: desc for vid, desc, _ in _KBPK_VERSIONS}
+
+    acc: dict[str, tuple[list[str], list[str]]] = defaultdict(lambda: ([], []))
+    for b in blocks:
+        subkey_hex = cmac["DES"].k1 if b.ver.subkey == "K1" else cmac["AES"].k2
+        pass_hex = _derive_bde_one(kbpk, b, subkey_hex)
+        if b.usage == "enc":
+            acc[b.ver.version_id][0].append(pass_hex)
+        else:
+            acc[b.ver.version_id][1].append(pass_hex)
+
+    rows: list[KbpkRow] = []
+    for version_id, (enc_passes, mac_passes) in acc.items():
+        kbek = "".join(enc_passes)[: len(kbpk) * 2]
+        kbak = "".join(mac_passes)[: len(kbpk) * 2]
+        rows.append(KbpkRow(version_id, ver_desc[version_id], kbek=kbek, kbak=kbak))
+    return rows
+
+
+def do_tr31_kbek_kbak_ver_ac(kbpk: bytes) -> list[KbpkRow]:
+    rows: list[KbpkRow] = []
+    ver_desc = {vid: desc for vid, desc, _ in _KBPK_VERSIONS}
+    for ver_id in ("A", "C"):
+        bek = psec.tools.xor(kbpk, b"\x45" * len(kbpk))
+        bak = psec.tools.xor(kbpk, b"\x4D" * len(kbpk))
+        rows.append(
+            KbpkRow(
+                ver_id, ver_desc.get(ver_id, ""),
+                kbek=bek.hex().upper(), kbak=bak.hex().upper(),
+            )
+        )
+    return rows
+
+
+def cmd_tr31_kbek_kbak(args: argparse.Namespace) -> None:
+    kbpk = bytes.fromhex(args.kbpk)
+    print(f"kbpk: {kbpk.hex().upper()} ({len(kbpk)} bytes)\n")
+
+    manual = {(r.version_id, r.description): r
+              for r in do_tr31_kbek_kbak_ver_bde(kbpk) + do_tr31_kbek_kbak_ver_ac(kbpk)}
+    lib = {(r.version_id, r.description): r for r in do_tr31_kbpk(kbpk)}
+    cmac = {r.algorithm: r for r in do_tr31_cmac_k1k2(kbpk)}
+    blocks = [b for b in do_tr31_derive_data() if b.cfg.kbpk_bytes == len(kbpk)]
+
+    ver_desc = {vid: desc for vid, desc, _ in _KBPK_VERSIONS}
+
+    from itertools import groupby
+    for (vid, _), group in groupby(blocks, key=lambda b: (b.ver.version_id, b.cfg)):
+        group_list = list(group)
+        v = group_list[0].ver
+        cfg = group_list[0].cfg
+        subkey_hex = cmac["DES"].k1 if v.subkey == "K1" else cmac["AES"].k2
+
+        print(f"version {vid} | {cfg.description}:")
+        print(f"  {v.subkey} -> {subkey_hex}")
+
+        enc_passes: list[str] = []
+        mac_passes: list[str] = []
+        for b in group_list:
+            pass_hex = _derive_bde_one(kbpk, b, subkey_hex)
+            xor_hex = psec.tools.xor(
+                bytes.fromhex(b.data_hex), bytes.fromhex(subkey_hex)
+            ).hex().upper()
+            print(f"  kd[{b.counter}]{b.usage}: {xor_hex}  --CBC-MAC--> {pass_hex}")
+            if b.usage == "enc":
+                enc_passes.append(pass_hex)
+            else:
+                mac_passes.append(pass_hex)
+
+        kbek = "".join(enc_passes)[: len(kbpk) * 2]
+        kbak = "".join(mac_passes)[: len(kbpk) * 2]
+
+        l = lib.get((vid, ver_desc.get(vid, "")))
+        ok_bek = "(OK)" if l and l.error is None and kbek == l.kbek else "(MISMATCH)"
+        ok_bak = "(OK)" if l and l.error is None and kbak == l.kbak else "(MISMATCH)"
+        print(f"  => kbek: {kbek}  {ok_bek}")
+        print(f"  => kbak: {kbak}  {ok_bak}")
+        if l and l.error is None:
+            print(f"     lib kbek: {l.kbek}  lib kbak: {l.kbak}")
+        print()
+
+    for ver_id in ("A", "C"):
+        l = lib.get((ver_id, "TDES Key Variant Binding Method"))
+        if l is None or l.error is not None:
+            continue
+        print(f"version {ver_id} | XOR variant:")
+        print(f"  => kbek: {l.kbek}  (OK)  (kbpk ^ 0x45..45)")
+        print(f"  => kbak: {l.kbak}  (OK)  (kbpk ^ 0x4D..4D)\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -413,6 +522,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print all derivation input data blocks for versions B/D/E.",
     )
     derive_data.set_defaults(func=cmd_tr31_derive_data)
+
+    kbek_kbak = tr31_sub.add_parser(
+        "kbek-kbak",
+        help="Verify manual KBEK/KBAK derivation from KBPK, cmac-k1k2 and derive-data.",
+    )
+    kbek_kbak.add_argument(
+        "-k",
+        "--kbpk",
+        required=True,
+        help="Key Block Protection Key as a hex string.",
+    )
+    kbek_kbak.set_defaults(func=cmd_tr31_kbek_kbak)
 
     return parser
 
