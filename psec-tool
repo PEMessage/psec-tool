@@ -183,6 +183,186 @@ def cmd_tr31_cmac_k1k2(args: argparse.Namespace) -> None:
             print(f"  k2: {r.k2}")
 
 
+@dataclass
+class KbpkConfig:
+    """One valid KBPK length for a given TR-31 version.
+
+    Maps directly to the kd_input bytes used in CMAC-based key derivation:
+
+        byte 0    : counter (1, 2, …)
+        byte 1-2  : key usage indicator
+        byte 3    : separator (always 0x00)
+        byte 4-5  : algorithm indicator → ``algo``
+        byte 6-7  : key length in bits    → ``keybits``
+        bytes 8.. : zero-padding to reach the version's block_size
+    """
+
+    kbpk_bytes: int
+    """KBPK key length in bytes (e.g. 16 for 2-key TDES or AES-128)."""
+
+    description: str
+    """Human-readable label (``"2-key"``, ``"AES-256"``, etc.)."""
+
+    algo: str
+    """Algorithm indicator, 2 hex chars (``"0000"`` = 2-key TDES,
+    ``"0004"`` = AES-256, etc.)."""
+
+    keybits: str
+    """Key length in bits, 2 hex chars (``"0080"`` = 128 bits,
+    ``"0100"`` = 256 bits, etc.)."""
+
+    counters: list[int]
+    """CMAC counter values (starting at 1).  The number of entries
+    determines how many CBC-MAC passes are concatenated to produce
+    keying material of the required length."""
+
+
+@dataclass
+class DeriveVersion:
+    """TR-31 version entry for CMAC-based key derivation.
+
+    Versions A/C are omitted — they use XOR-variant derivation
+    and have no kd_input data blocks.
+    """
+
+    version_id: str
+    """TR-31 version letter (``"B"``, ``"D"``, ``"E"``)."""
+
+    cipher: str
+    """Block cipher family (``"TDES"`` or ``"AES"``)."""
+
+    block_size: int
+    """Encryption block size in bytes (8 for TDES, 16 for AES)."""
+
+    kbpk_configs: list[KbpkConfig]
+    """Valid KBPK lengths and their kd_input parameters."""
+
+    subkey: str
+    """CMAC subkey used to mask the derivation input before CBC-MAC:
+    ``"K1"`` for TDES (from ``_derive_des_cmac_subkey``),
+    ``"K2"`` for AES  (from ``_derive_aes_cmac_subkey``)."""
+
+    usage_enc: str
+    """Usage indicator for the encryption KBEK, 2 hex chars:
+    ``"0000"`` on versions B/D, ``"0002"`` (AES-CTR) on version E."""
+
+    usage_mac: str
+    """Usage indicator for the authentication KBAK, always ``"0001"``."""
+
+
+# Derivation procedure for versions B / D / E:
+#   1.  Derive CMAC subkey from KBPK: K1 (TDES) or K2 (AES).
+#   2.  For each counter in ``counters``:
+#       a. Set byte 0 = counter.
+#       b. Set bytes 1-2 = usage (enc or mac).
+#       c. XOR the full kd_input block with the subkey.
+#       d. Run CBC-MAC (IV=0, effectively ECB on one block) under KBPK.
+#       e. Each call yields 64 bits (TDES) or 128 bits (AES).
+#   3.  Concatenate passes, truncate to KBPK length:
+#         usage_enc → KBEK   usage_mac → KBAK
+_DERIVE_DATA: list[DeriveVersion] = [
+    DeriveVersion(
+        version_id="B",
+        cipher="TDES",
+        block_size=8,
+        subkey="K1",
+        usage_enc="0000",
+        usage_mac="0001",
+        kbpk_configs=[
+            KbpkConfig(kbpk_bytes=16, description="2-key", algo="0000", keybits="0080", counters=[1, 2]),
+            KbpkConfig(kbpk_bytes=24, description="3-key", algo="0001", keybits="00C0", counters=[1, 2, 3]),
+        ],
+    ),
+    DeriveVersion(
+        version_id="D",
+        cipher="AES",
+        block_size=16,
+        subkey="K2",
+        usage_enc="0000",
+        usage_mac="0001",
+        kbpk_configs=[
+            KbpkConfig(kbpk_bytes=16, description="AES-128", algo="0002", keybits="0080", counters=[1]),
+            KbpkConfig(kbpk_bytes=24, description="AES-192", algo="0003", keybits="00C0", counters=[1, 2]),
+            KbpkConfig(kbpk_bytes=32, description="AES-256", algo="0004", keybits="0100", counters=[1, 2]),
+        ],
+    ),
+    DeriveVersion(
+        version_id="E",
+        cipher="AES",
+        block_size=16,
+        subkey="K2",
+        usage_enc="0002",
+        usage_mac="0001",
+        kbpk_configs=[
+            KbpkConfig(kbpk_bytes=16, description="AES-128", algo="0002", keybits="0080", counters=[1]),
+            KbpkConfig(kbpk_bytes=24, description="AES-192", algo="0003", keybits="00C0", counters=[1, 2]),
+            KbpkConfig(kbpk_bytes=32, description="AES-256", algo="0004", keybits="0100", counters=[1, 2]),
+        ],
+    ),
+]
+
+
+def _build_derive_data_block(
+    block_size: int, counter: int, usage: str, algo: str, keybits: str
+) -> str:
+    b = bytearray(block_size)
+    b[0] = counter
+    b[1:3] = bytes.fromhex(usage)
+    b[4:6] = bytes.fromhex(algo)
+    b[6:8] = bytes.fromhex(keybits)
+    return b.hex().upper()
+
+
+@dataclass
+class DeriveDataBlock:
+    ver: DeriveVersion
+    cfg: KbpkConfig
+    counter: int
+    usage: str
+    data_hex: str
+
+
+def do_tr31_derive_data() -> list[DeriveDataBlock]:
+    rows: list[DeriveDataBlock] = []
+    for v in _DERIVE_DATA:
+        for cfg in v.kbpk_configs:
+            for counter in cfg.counters:
+                for usage_label, usage_hex in [("enc", v.usage_enc),
+                                                ("mac", v.usage_mac)]:
+                    data = _build_derive_data_block(
+                        v.block_size, counter, usage_hex, cfg.algo, cfg.keybits
+                    )
+                    rows.append(
+                        DeriveDataBlock(
+                            ver=v,
+                            cfg=cfg,
+                            counter=counter,
+                            usage=usage_label,
+                            data_hex=data,
+                        )
+                    )
+    return rows
+
+
+def cmd_tr31_derive_data(args: argparse.Namespace) -> None:
+    prev_cfg = None
+    for r in do_tr31_derive_data():
+        if r.cfg is not prev_cfg:
+            print(
+                f"version {r.ver.version_id} | cipher={r.ver.cipher} | "
+                f"{r.cfg.description} | kbpk={r.cfg.kbpk_bytes}bytes | "
+                f"subkey={r.ver.subkey} | calls={len(r.cfg.counters)}"
+            )
+            print(f"  block_size={r.ver.block_size}")
+            print(f"    algo={r.cfg.algo}  keybits={r.cfg.keybits}")
+        print(
+            f"      counter={r.counter}  "
+            f"usage_{r.usage}={r.ver.usage_enc if r.usage == 'enc' else r.ver.usage_mac}  "
+            f"=> {r.data_hex}"
+        )
+        prev_cfg = r.cfg
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psec-tool",
@@ -227,6 +407,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Key as a hex string.",
     )
     cmac_k1k2.set_defaults(func=cmd_tr31_cmac_k1k2)
+
+    derive_data = tr31_sub.add_parser(
+        "derive-data",
+        help="Print all derivation input data blocks for versions B/D/E.",
+    )
+    derive_data.set_defaults(func=cmd_tr31_derive_data)
 
     return parser
 
