@@ -9,6 +9,7 @@
 import argparse
 import sys
 import warnings
+from dataclasses import dataclass
 
 from cryptography.utils import CryptographyDeprecationWarning
 
@@ -30,17 +31,36 @@ def _print_header(header: "psec.tr31.Header") -> None:
         print(f"    block[{block_id}]:   {block_data}")
 
 
-def cmd_tr31_unwrap(args: argparse.Namespace) -> None:
-    if args.kbpk is None:
-        header = psec.tr31.Header()
-        header.load(args.key_block)
-        _print_header(header)
-        return
+@dataclass
+class UnwrapResult:
+    header: "psec.tr31.Header"
+    key: bytes | None = None
+    error: str | None = None
 
-    kbpk = bytes.fromhex(args.kbpk)
-    header, key = psec.tr31.unwrap(kbpk=kbpk, key_block=args.key_block)
-    _print_header(header)
-    print(f"key: {key.hex().upper()}")
+
+def do_tr31_unwrap(kbpk: bytes | None, key_block: str) -> UnwrapResult:
+    if kbpk is None:
+        header = psec.tr31.Header()
+        header.load(key_block)
+        return UnwrapResult(header=header)
+    try:
+        header, key = psec.tr31.unwrap(kbpk=kbpk, key_block=key_block)
+    except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
+        header = psec.tr31.Header()
+        header.load(key_block)
+        return UnwrapResult(header=header, error=str(e))
+    return UnwrapResult(header=header, key=key)
+
+
+def cmd_tr31_unwrap(args: argparse.Namespace) -> None:
+    kbpk = bytes.fromhex(args.kbpk) if args.kbpk else None
+    r = do_tr31_unwrap(kbpk, args.key_block)
+    _print_header(r.header)
+    if r.error is not None:
+        print(f"error: {r.error}", file=sys.stderr)
+        sys.exit(1)
+    if r.key is not None:
+        print(f"key: {r.key.hex().upper()}")
 
 
 _KBPK_VERSIONS = [
@@ -52,24 +72,53 @@ _KBPK_VERSIONS = [
 ]
 
 
-def cmd_tr31_kbpk(args: argparse.Namespace) -> None:
-    kbpk = bytes.fromhex(args.kbpk)
-    print(f"kbpk: {kbpk.hex().upper()} ({len(kbpk)} bytes)")
+@dataclass
+class KbpkRow:
+    version_id: str
+    description: str
+    kbek: str = ""
+    kbak: str = ""
+    error: str | None = None
+
+
+def do_tr31_kbpk(kbpk: bytes) -> list[KbpkRow]:
+    rows: list[KbpkRow] = []
     for version_id, description, method in _KBPK_VERSIONS:
-        print(f"version {version_id} ({description}):")
         kb = psec.tr31.KeyBlock(
             kbpk=kbpk, header=psec.tr31.Header(version_id=version_id)
         )
         try:
             kbek, kbak = getattr(kb, method)()
         except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
-            print(f"  n/a: {e}")
+            rows.append(KbpkRow(version_id, description, error=str(e)))
             continue
-        print(f"  kbek: {kbek.hex().upper()}")
-        print(f"  kbak: {kbak.hex().upper()}")
+        rows.append(
+            KbpkRow(version_id, description, kbek=kbek.hex().upper(), kbak=kbak.hex().upper())
+        )
+    return rows
 
 
-def cmd_tr31_cmac_k1k2(args: argparse.Namespace) -> None:
+def cmd_tr31_kbpk(args: argparse.Namespace) -> None:
+    kbpk = bytes.fromhex(args.kbpk)
+    print(f"kbpk: {kbpk.hex().upper()} ({len(kbpk)} bytes)")
+    for r in do_tr31_kbpk(kbpk):
+        print(f"version {r.version_id} ({r.description}):")
+        if r.error is not None:
+            print(f"  n/a: {r.error}")
+        else:
+            print(f"  kbek: {r.kbek}")
+            print(f"  kbak: {r.kbak}")
+
+
+@dataclass
+class CmacSubkeyResult:
+    algorithm: str
+    k1: str | None = None
+    k2: str | None = None
+    error: str | None = None
+
+
+def do_tr31_cmac_k1k2(key: bytes) -> list[CmacSubkeyResult]:
     # CMAC subkeys K1/K2 (NIST SP 800-38B). These are a low-level primitive:
     # K1/K2 = shift-left-1 of E_K(0), conditionally XOR'd with Rb
     # (Rb = ...1B for DES 8-byte blocks, ...87 for AES 16-byte blocks).
@@ -84,11 +133,20 @@ def cmd_tr31_cmac_k1k2(args: argparse.Namespace) -> None:
     #     2. Build a derivation input block carrying:
     #          counter | usage (0000=enc / 0001=mac) | 00 | algo | key-bits
     #     3. XOR that input with the subkey (K1 for DES, K2 for AES) and
-    #        run it through CBC-MAC under the KBPK. Each pass yields 64 bits
-    #        (DES) or 128 bits (AES) of keying material.
+    #        run it through CBC-MAC under the KBPK (with IV=0, effectively
+    #        ECB on a single block). Each pass yields 64 bits (DES) or 128
+    #        bits (AES) of keying material.
     #     4. Concatenate passes (incrementing the counter) until enough bits:
     #          usage=0000 -> KBEK (encryption key)
     #          usage=0001 -> KBAK (authentication key)
+    #     5. Truncate to the KBPK length.
+    #
+    #   Example (AES-128 version D, step by step):
+    #     _, K2 = cmac-subkey-aes(KBPK)
+    #     di = [01][0000][00][0002][0080][00...00]   # usage=enc, algo=AES-128
+    #     KBEK = CBC-MAC(KBPK, di XOR K2)             # 1 pass = 16 bytes
+    #     di[usage] = 0001
+    #     KBAK = CBC-MAC(KBPK, di XOR K2)
     #
     #   The KBAK is then itself fed through the CMAC-subkey step again when
     #   generating the final key-block MAC (the last block is XOR'd with K1
@@ -96,19 +154,33 @@ def cmd_tr31_cmac_k1k2(args: argparse.Namespace) -> None:
     #
     #   Version A/C do NOT use CMAC subkeys at all; they derive KBEK/KBAK by
     #   XOR'ing the KBPK with the constants 0x45.. / 0x4D.. (variant method).
-    key = bytes.fromhex(args.key)
-    print(f"key: {key.hex().upper()} ({len(key)} bytes)")
     kb = psec.tr31.KeyBlock(kbpk=b"\x00" * 16)
-    for algorithm, method in (("DES", "_derive_des_cmac_subkey"),
-                              ("AES", "_derive_aes_cmac_subkey")):
-        print(f"{algorithm}:")
+    results: list[CmacSubkeyResult] = []
+    for algorithm, method in (
+        ("DES", "_derive_des_cmac_subkey"),
+        ("AES", "_derive_aes_cmac_subkey"),
+    ):
         try:
             k1, k2 = getattr(kb, method)(key)
         except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
-            print(f"  n/a: {e}")
+            results.append(CmacSubkeyResult(algorithm, error=str(e)))
             continue
-        print(f"  k1: {k1.hex().upper()}")
-        print(f"  k2: {k2.hex().upper()}")
+        results.append(
+            CmacSubkeyResult(algorithm, k1=k1.hex().upper(), k2=k2.hex().upper())
+        )
+    return results
+
+
+def cmd_tr31_cmac_k1k2(args: argparse.Namespace) -> None:
+    key = bytes.fromhex(args.key)
+    print(f"key: {key.hex().upper()} ({len(key)} bytes)")
+    for r in do_tr31_cmac_k1k2(key):
+        print(f"{r.algorithm}:")
+        if r.error is not None:
+            print(f"  n/a: {r.error}")
+        else:
+            print(f"  k1: {r.k1}")
+            print(f"  k2: {r.k2}")
 
 
 def build_parser() -> argparse.ArgumentParser:
