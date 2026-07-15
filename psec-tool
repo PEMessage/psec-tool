@@ -187,13 +187,6 @@ class VersionCfg:
     kbpk_bytes: int
 
 
-@dataclass
-class DeriveData:
-    """All derivation blocks for one ``VersionCfg``."""
-    vc: VersionCfg
-    blocks: dict[str, list[bytes]]  # "enc" | "mac" -> data per counter
-
-
 def _lookup(vc: VersionCfg) -> tuple[Tr31Version, KbpkConfig]:
     """Resolve a ``VersionCfg`` to its full objects."""
     v = _VERSIONS[vc.version_id]
@@ -201,25 +194,11 @@ def _lookup(vc: VersionCfg) -> tuple[Tr31Version, KbpkConfig]:
 
 
 # ---------------------------------------------------------------------------
-# helper
-# ---------------------------------------------------------------------------
-
-def _build_derive_data_block(
-    block_size: int, counter: int, usage: bytes, algo: bytes, keybits: bytes,
-) -> bytes:
-    data = bytes([counter]) + usage + b"\x00" + algo + keybits
-    pad = block_size - (len(data) % block_size)
-    if pad != block_size:
-        data = psec.mac.pad_iso_2(data, block_size)
-    return data
-
-
-# ---------------------------------------------------------------------------
 # shared result types
 # ---------------------------------------------------------------------------
 
 @dataclass
-class KbpkRow:
+class WorkKeyResult:
     version_id: VersionId
     description: str
     kbek: bytes = b""
@@ -227,7 +206,6 @@ class KbpkRow:
     error: str | None = None
 
 
-@dataclass
 @dataclass
 class CmacSubkeyResult:
     algorithm: Algorithm
@@ -319,7 +297,7 @@ def cmd_tr31_wrap(args: argparse.Namespace) -> None:
 # kbpk  (library KBEK / KBAK)
 # ---------------------------------------------------------------------------
 
-def _derive_kbek_kbak_lib_once(kbpk: bytes, version_id: VersionId) -> tuple[bytes, bytes]:
+def _gen_work_keylib_once(kbpk: bytes, version_id: VersionId) -> tuple[bytes, bytes]:
     """Derive KBEK/KBAK for a single version via the psec library."""
     _method = {
         VersionId.A: "_c_derive", VersionId.B: "_b_derive",
@@ -332,24 +310,24 @@ def _derive_kbek_kbak_lib_once(kbpk: bytes, version_id: VersionId) -> tuple[byte
     return getattr(kb, _method[version_id])()
 
 
-def do_tr31_kbpk(kbpk: bytes) -> dict[VersionId, KbpkRow]:
-    rows: dict[VersionId, KbpkRow] = {}
+def do_tr31_gen_work_key_lib(kbpk: bytes) -> dict[VersionId, WorkKeyResult]:
+    rows: dict[VersionId, WorkKeyResult] = {}
     for v in _VERSIONS.values():
         try:
-            kbek, kbak = _derive_kbek_kbak_lib_once(kbpk, v.version_id)
-            rows[v.version_id] = KbpkRow(
+            kbek, kbak = _gen_work_keylib_once(kbpk, v.version_id)
+            rows[v.version_id] = WorkKeyResult(
                 v.version_id, v.description,
                 kbek=kbek, kbak=kbak,
             )
         except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
-            rows[v.version_id] = KbpkRow(v.version_id, v.description, error=str(e))
+            rows[v.version_id] = WorkKeyResult(v.version_id, v.description, error=str(e))
     return rows
 
 
 def cmd_tr31_kbpk(args: argparse.Namespace) -> None:
     kbpk = bytes.fromhex(args.kbpk)
     print(f"kbpk: {kbpk.hex().upper()} ({len(kbpk)} bytes)")
-    for r in do_tr31_kbpk(kbpk).values():
+    for r in do_tr31_gen_work_key_lib(kbpk).values():
         print(f"version {r.version_id} ({r.description}):")
         if r.error is not None:
             print(f"  n/a: {r.error}")
@@ -436,12 +414,6 @@ def cmd_tr31_cmac_k1k2(args: argparse.Namespace) -> None:
 # cmac
 # ---------------------------------------------------------------------------
 
-@dataclass
-class CmacResult:
-    mac: bytes = b""
-    error: str | None = None
-
-
 def _cmac_once(key: bytes, data: bytes, cipher: Algorithm) -> bytes:
     """Compute CMAC (NIST SP 800-38B) tag over ``data``.
 
@@ -473,42 +445,57 @@ def _cmac_once(key: bytes, data: bytes, cipher: Algorithm) -> bytes:
     return psec.mac.generate_cbc_mac(key, data, 1, block_size, cipher.mac_algorithm)
 
 
-def do_tr31_cmac(key: bytes, data: bytes, cipher: Algorithm) -> CmacResult:
-    try:
-        return CmacResult(mac=_cmac_once(key, data, cipher))
-    except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
-        return CmacResult(error=str(e))
-
-
 def cmd_tr31_cmac(args: argparse.Namespace) -> None:
     key = bytes.fromhex(args.key)
     data = bytes.fromhex(args.data)
-    r = do_tr31_cmac(key, data, Algorithm(args.algo))
-    if r.error is not None:
-        print(f"error: {r.error}", file=sys.stderr)
-        sys.exit(1)
-    print(r.mac.hex().upper())
+    mac = _cmac_once(key, data, Algorithm(args.algo))
+    print(mac.hex().upper())
 
 
 # ---------------------------------------------------------------------------
 # derive-data
 # ---------------------------------------------------------------------------
 
-def _derive_data_blocks_once(vc: VersionCfg) -> dict[str, list[bytes]]:
+@dataclass
+class DeriveBlock:
+    """One derivation input block (one counter × usage pair)."""
+    counter: int
+    usage_label: str         # "enc" or "mac"
+    raw: bytes               # unpadded derivation input
+    padded: bytes            # ISO-9797-1 method-2 padded block (or raw if none needed)
+    has_padding: bool        # True when ISO padding was applied
+
+
+@dataclass
+class DeriveData:
+    """All derivation blocks for one ``VersionCfg``."""
+    vc: VersionCfg
+    blocks: dict[str, list[DeriveBlock]]  # "enc" | "mac" -> list of DeriveBlock
+
+
+def _derive_data_blocks_once(vc: VersionCfg) -> dict[str, list[DeriveBlock]]:
     """Derive input data blocks for a single ``VersionCfg``.
 
-    Returns ``{"enc": [...], "mac": [...]}`` — one data block per
-    counter/usage pair.
+    Returns ``{"enc": [...], "mac": [...]}`` — one ``DeriveBlock`` per
+    counter/usage pair, carrying both the raw (unpadded) derivation
+    input and the ISO-9797-1 method-2 padded variant.
     """
     v, cfg = _lookup(vc)
-    blocks: dict[str, list[bytes]] = {"enc": [], "mac": []}
+    blocks: dict[str, list[DeriveBlock]] = {"enc": [], "mac": []}
     for counter in cfg.counters:
         for usage_label, usage in [("enc", v.usage_enc),
                                    ("mac", v.usage_mac)]:
-            data = _build_derive_data_block(
-                v.block_size, counter, usage, cfg.algo, cfg.keybits,
-            )
-            blocks[usage_label].append(data)
+            raw_data = bytes([counter]) + usage + b"\x00" + cfg.algo + cfg.keybits
+            pad = v.block_size - (len(raw_data) % v.block_size)
+            has_padding = pad != v.block_size
+            padded = psec.mac.pad_iso_2(raw_data, v.block_size) if has_padding else raw_data
+            blocks[usage_label].append(DeriveBlock(
+                counter=counter,
+                usage_label=usage_label,
+                raw=raw_data,
+                padded=padded,
+                has_padding=has_padding,
+            ))
     return blocks
 
 
@@ -533,18 +520,17 @@ def cmd_tr31_derive_data(args: argparse.Namespace) -> None:
         )
         print(f"  block_size={v.block_size}")
         print(f"    algo={cfg.algo.hex().upper()}  keybits={cfg.keybits.hex().upper()}")
-        for i, counter in enumerate(cfg.counters):
-            enc_data = d.blocks["enc"][i]
-            mac_data = d.blocks["mac"][i]
+        for b in d.blocks["enc"]:
             print(
-                f"      counter={counter}  "
+                f"      counter={b.counter}  "
                 f"usage_enc=({v.usage_enc.hex().upper()}): "
-                f"=> {enc_data.hex().upper()}"
+                f"=> {b.padded.hex().upper()}"
             )
+        for b in d.blocks["mac"]:
             print(
-                f"      counter={counter}  "
+                f"      counter={b.counter}  "
                 f"usage_mac=({v.usage_mac.hex().upper()}): "
-                f"=> {mac_data.hex().upper()}"
+                f"=> {b.padded.hex().upper()}"
             )
 
 
@@ -553,83 +539,77 @@ def cmd_tr31_derive_data(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ConDeriveTrace(KbpkRow):
+class CmacWorkKeyResult(WorkKeyResult):
     subkey_name: str = ""
     subkey: bytes = b""
-    passes: list[tuple[int, str, bytes, bytes]] = field(default_factory=list)
-    # (counter, usage_label, xor, pass_result) per CMAC pass
+    passes: dict[str, list[dict[str, bytes]]] = field(
+        default_factory=lambda: {"enc": [], "mac": []},
+    )
+    # "enc" | "mac" -> list of {"xor": ..., "cmac": ...} per counter
 
 
-def _derive_kbek_kbak_cmac_once(kbpk: bytes, version_id: VersionId) -> ConDeriveTrace:
+def _gen_work_keycmac_once(kbpk: bytes, version_id: VersionId) -> CmacWorkKeyResult:
     """Derive KBEK/KBAK for a single CMAC version.
 
     Applies standard NIST CMAC to the raw (unpadded) derivation input
-    block.  Returns full trace including per-pass XOR data and
-    CMAC results.
+    blocks obtained from ``_derive_data_blocks_once``.
     """
     vc = VersionCfg(version_id, len(kbpk))
     v, cfg = _lookup(vc)
-    block_size = v.algorithm.block_size
     k1, k2 = _derive_cmac_subkey_once(kbpk, v.algorithm)
 
-    trace = ConDeriveTrace(
+    data_blocks = _derive_data_blocks_once(vc)
+
+    trace = CmacWorkKeyResult(
         version_id=v.version_id,
         description=cfg.description,
         subkey_name=v.subkey,
         subkey=k1 if v.subkey == "K1" else k2,
     )
-    for counter in cfg.counters:
-        for usage_label, usage in [("enc", v.usage_enc),
-                                   ("mac", v.usage_mac)]:
-            raw_data = bytes([counter]) + usage + b"\x00" + cfg.algo + cfg.keybits
-            pass_bytes = _cmac_once(kbpk, raw_data, v.algorithm)
+    result = trace
+    workkey: dict[str, bytes] = {"enc": b"", "mac": b""}
+    for usage_label in ("enc", "mac"):
+        for b in data_blocks[usage_label]:
+            pass_bytes = _cmac_once(kbpk, b.raw, v.algorithm)
 
-            # Reconstruct the XOR'd block for tracing
-            remainder = len(raw_data) % block_size
-            if remainder != 0:
-                padded = psec.mac.pad_iso_2(raw_data, block_size)
-                last_subkey = k2
-            else:
-                padded = raw_data
-                last_subkey = k1
-            xor_bytes = psec.tools.xor(padded[-block_size:], last_subkey)
+            last_subkey = k2 if b.has_padding else k1
+            xor_bytes = psec.tools.xor(b.padded, last_subkey)
 
-            trace.passes.append((counter, usage_label, xor_bytes, pass_bytes))
-            if usage_label == "enc":
-                trace.kbek += pass_bytes
-            else:
-                trace.kbak += pass_bytes
+            trace.passes[usage_label].append({"xor": xor_bytes, "cmac": pass_bytes})
+            workkey[usage_label] += pass_bytes
 
-    trace.kbek = trace.kbek[:len(kbpk)]
-    trace.kbak = trace.kbak[:len(kbpk)]
-    return trace
+    for v in workkey.values():
+        assert len(v) >= len(kbpk)
+    result.kbek = workkey["enc"][:len(kbpk)]
+    result.kbak = workkey["mac"][:len(kbpk)]
+    return result
 
 
-def do_tr31_kbek_kbak_ver_derive(kbpk: bytes) -> dict[VersionId, ConDeriveTrace]:
-    acc: dict[VersionId, ConDeriveTrace] = {}
+def do_tr31_gen_work_key_cmac(kbpk: bytes) -> dict[VersionId, CmacWorkKeyResult]:
+    acc: dict[VersionId, CmacWorkKeyResult] = {}
     for version_id, v in _VERSIONS.items():
         if v.method != "cmac":
             continue
         if len(kbpk) not in v.kbpk_configs:
             continue
-        acc[version_id] = _derive_kbek_kbak_cmac_once(kbpk, version_id)
+        acc[version_id] = _gen_work_keycmac_once(kbpk, version_id)
     return acc
 
 
-def _derive_kbek_kbak_xvariant_once(kbpk: bytes, version_id: VersionId) -> KbpkRow:
+def _gen_work_keyxvariant_once(kbpk: bytes, version_id: VersionId) -> WorkKeyResult:
     """Derive KBEK/KBAK for a single XOR-variant version."""
     v = _VERSIONS[version_id]
     bek = psec.tools.xor(kbpk, b"\x45" * len(kbpk))
     bak = psec.tools.xor(kbpk, b"\x4D" * len(kbpk))
-    return KbpkRow(version_id, v.description, kbek=bek, kbak=bak)
+    return WorkKeyResult(version_id, v.description, kbek=bek, kbak=bak)
 
 
-def do_tr31_kbek_kbak_ver_xvariant(kbpk: bytes) -> dict[VersionId, KbpkRow]:
-    rows: dict[VersionId, KbpkRow] = {}
+def do_tr31_gen_work_key_xvariant(kbpk: bytes) -> dict[VersionId, WorkKeyResult]:
+    rows: dict[VersionId, WorkKeyResult] = {}
     for v in _VERSIONS.values():
         if v.method != "xvariant":
             continue
-        rows[v.version_id] = _derive_kbek_kbak_xvariant_once(kbpk, v.version_id)
+        rows[v.version_id] = _gen_work_keyxvariant_once(kbpk, v.version_id)
     return rows
 
 
@@ -641,30 +621,31 @@ def cmd_tr31_kbek_kbak(args: argparse.Namespace) -> None:
     kbpk = bytes.fromhex(args.kbpk)
     print(f"kbpk: {kbpk.hex().upper()} ({len(kbpk)} bytes)\n")
 
-    lib_by_ver = do_tr31_kbpk(kbpk)
-    manual_derive = do_tr31_kbek_kbak_ver_derive(kbpk)
-    manual_xvariant = do_tr31_kbek_kbak_ver_xvariant(kbpk)
+    lib = do_tr31_gen_work_key_lib(kbpk)
+    cmac = do_tr31_gen_work_key_cmac(kbpk)
+    xvariant = do_tr31_gen_work_key_xvariant(kbpk)
 
-    for version_id, t in manual_derive.items():
-        print(f"version {t.version_id} | {t.description}:")
-        print(f"  {t.subkey_name} -> {t.subkey.hex().upper()}")
-        for counter, usage, xor_bytes, pass_bytes in t.passes:
-            print(f"  kd[{counter}]{usage}: {xor_bytes.hex().upper()}  --CBC-MAC--> {pass_bytes.hex().upper()}")
-        print(f"  => kbek: {t.kbek.hex().upper()}")
-        print(f"  => kbak: {t.kbak.hex().upper()}")
+    for version_id, r in cmac.items():
+        print(f"version {r.version_id} | {r.description}:")
+        print(f"  {r.subkey_name} -> {r.subkey.hex().upper()}")
+        for usage_label in ("enc", "mac"):
+            for i, p in enumerate(r.passes[usage_label], 1):
+                print(f"  kd[{i}]{usage_label}: {p['xor'].hex().upper()}  --CMAC--> {p['cmac'].hex().upper()}")
+        print(f"  => kbek: {r.kbek.hex().upper()}")
+        print(f"  => kbak: {r.kbak.hex().upper()}")
 
-        l = lib_by_ver[version_id]
+        l = lib[version_id]
         if l.error is None:
-            ok_bek = "(OK)" if t.kbek == l.kbek else "(MISMATCH)"
-            ok_bak = "(OK)" if t.kbak == l.kbak else "(MISMATCH)"
+            ok_bek = "(OK)" if r.kbek == l.kbek else "(MISMATCH)"
+            ok_bak = "(OK)" if r.kbak == l.kbak else "(MISMATCH)"
             print(f"     lib kbek: {l.kbek.hex().upper()}  {ok_bek}")
             print(f"     lib kbak: {l.kbak.hex().upper()}  {ok_bak}")
         else:
             print("     lib: n/a")
         print()
 
-    for version_id, r in manual_xvariant.items():
-        l = lib_by_ver[version_id]
+    for version_id, r in xvariant.items():
+        l = lib[version_id]
         if l.error is not None:
             continue
         print(f"version {r.version_id} | XOR variant:")
