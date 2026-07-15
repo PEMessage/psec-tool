@@ -186,10 +186,9 @@ def _build_derive_data_block(
     block_size: int, counter: int, usage: bytes, algo: bytes, keybits: bytes,
 ) -> bytes:
     data = bytes([counter]) + usage + b"\x00" + algo + keybits
-    # ISO 9797-1 method 2: append 0x80 then zero-fill to block_size
     pad = block_size - (len(data) % block_size)
     if pad != block_size:
-        data += b"\x80" + b"\x00" * (pad - 1)
+        data = psec.mac.pad_iso_2(data, block_size)
     return data
 
 
@@ -297,18 +296,24 @@ def cmd_tr31_wrap(args: argparse.Namespace) -> None:
 # kbpk  (library KBEK / KBAK)
 # ---------------------------------------------------------------------------
 
-def do_tr31_kbpk(kbpk: bytes) -> dict[VersionId, KbpkRow]:
+def _derive_kbek_kbak_lib_once(kbpk: bytes, version_id: VersionId) -> tuple[bytes, bytes]:
+    """Derive KBEK/KBAK for a single version via the psec library."""
     _method = {
-        VersionId.B: "_b_derive", VersionId.D: "_d_derive", VersionId.E: "_e_derive",
-        VersionId.A: "_c_derive", VersionId.C: "_c_derive",
+        VersionId.A: "_c_derive", VersionId.B: "_b_derive",
+        VersionId.C: "_c_derive", VersionId.D: "_d_derive",
+        VersionId.E: "_e_derive",
     }
+    kb = psec.tr31.KeyBlock(
+        kbpk=kbpk, header=psec.tr31.Header(version_id=version_id),
+    )
+    return getattr(kb, _method[version_id])()
+
+
+def do_tr31_kbpk(kbpk: bytes) -> dict[VersionId, KbpkRow]:
     rows: dict[VersionId, KbpkRow] = {}
     for v in _VERSIONS.values():
-        kb = psec.tr31.KeyBlock(
-            kbpk=kbpk, header=psec.tr31.Header(version_id=v.version_id)
-        )
         try:
-            kbek, kbak = getattr(kb, _method[v.version_id])()
+            kbek, kbak = _derive_kbek_kbak_lib_once(kbpk, v.version_id)
             rows[v.version_id] = KbpkRow(
                 v.version_id, v.description,
                 kbek=kbek, kbak=kbak,
@@ -334,41 +339,57 @@ def cmd_tr31_kbpk(args: argparse.Namespace) -> None:
 # cmac-k1k2
 # ---------------------------------------------------------------------------
 
-def do_tr31_cmac_k1k2(key: bytes) -> dict[str, CmacSubkeyResult]:
-    # CMAC subkeys K1/K2 (NIST SP 800-38B). These are a low-level primitive:
-    # K1/K2 = shift-left-1 of E_K(0), conditionally XOR'd with Rb
-    # (Rb = ...1B for DES 8-byte blocks, ...87 for AES 16-byte blocks).
-    #
-    # These subkeys are NOT the KBEK/KBAK themselves; they are a building
-    # block used *inside* the KBEK/KBAK derivation (see `tr31 kbpk`):
-    #
-    #   Version B (TDES) / D / E (AES) key derivation:
-    #     1. Derive CMAC subkeys from the KBPK:
-    #          DES: K1, _ = _derive_des_cmac_subkey(kbpk)   (uses K1)
-    #          AES: _, K2 = _derive_aes_cmac_subkey(kbpk)   (uses K2)
-    #     2. Build a derivation input block carrying:
-    #          counter | usage (enc/mac) | 00 | algo | key-bits | pad
-    #     3. XOR that input with the subkey (K1 for DES, K2 for AES) and
-    #        run it through CBC-MAC under KBPK (IV=0 → ECB on one block).
-    #        Each pass yields 64 bits (DES) or 128 bits (AES) of key material.
-    #     4. Concatenate passes (incrementing counter) until enough bits:
-    #          usage_enc → KBEK   usage_mac → KBAK
-    #     5. Truncate to KBPK length.
-    #
-    #   The KBAK is then itself fed through the CMAC-subkey step again when
-    #   generating the final key-block MAC (the last MAC-data block is XOR'd
-    #   with K1 of the KBAK before the CBC-MAC pass).
-    #
-    #   Version A/C do NOT use CMAC subkeys at all; they derive KBEK/KBAK by
-    #   XOR'ing the KBPK with the constants 0x45.. / 0x4D.. (variant method).
+def _derive_cmac_subkey_once(key: bytes, cipher: str) -> tuple[bytes, bytes]:
+    """Derive CMAC subkeys K1, K2 for a single cipher algorithm.
+
+    Parameters
+    ----------
+    key : bytes
+        The key to derive CMAC subkeys from.
+    cipher : str
+        ``"TDES"`` or ``"AES"``.
+
+    Returns
+    -------
+    k1, k2 : tuple[bytes, bytes]
+    """
+    method = "_derive_des_cmac_subkey" if cipher == "TDES" else "_derive_aes_cmac_subkey"
     kb = psec.tr31.KeyBlock(kbpk=b"\x00" * 16)
+    return getattr(kb, method)(key)
+
+
+# CMAC subkeys K1/K2 (NIST SP 800-38B). These are a low-level primitive:
+# K1/K2 = shift-left-1 of E_K(0), conditionally XOR'd with Rb
+# (Rb = ...1B for DES 8-byte blocks, ...87 for AES 16-byte blocks).
+#
+# These subkeys are NOT the KBEK/KBAK themselves; they are a building
+# block used *inside* the KBEK/KBAK derivation (see `tr31 kbpk`):
+#
+#   Version B (TDES) / D / E (AES) key derivation:
+#     1. Derive CMAC subkeys from the KBPK:
+#          DES: K1, _ = _derive_des_cmac_subkey(kbpk)   (uses K1)
+#          AES: _, K2 = _derive_aes_cmac_subkey(kbpk)   (uses K2)
+#     2. Build a derivation input block carrying:
+#          counter | usage (enc/mac) | 00 | algo | key-bits | pad
+#     3. XOR that input with the subkey (K1 for DES, K2 for AES) and
+#        run it through CBC-MAC under KBPK (IV=0 → ECB on one block).
+#        Each pass yields 64 bits (DES) or 128 bits (AES) of key material.
+#     4. Concatenate passes (incrementing counter) until enough bits:
+#          usage_enc → KBEK   usage_mac → KBAK
+#     5. Truncate to KBPK length.
+#
+#   The KBAK is then itself fed through the CMAC-subkey step again when
+#   generating the final key-block MAC (the last MAC-data block is XOR'd
+#   with K1 of the KBAK before the CBC-MAC pass).
+#
+#   Version A/C do NOT use CMAC subkeys at all; they derive KBEK/KBAK by
+#   XOR'ing the KBPK with the constants 0x45.. / 0x4D.. (variant method).
+
+def do_tr31_cmac_k1k2(key: bytes) -> dict[str, CmacSubkeyResult]:
     results: dict[str, CmacSubkeyResult] = {}
-    for algorithm, method in (
-        ("DES", "_derive_des_cmac_subkey"),
-        ("AES", "_derive_aes_cmac_subkey"),
-    ):
+    for algorithm, cipher in (("DES", "TDES"), ("AES", "AES")):
         try:
-            k1, k2 = getattr(kb, method)(key)
+            k1, k2 = _derive_cmac_subkey_once(key, cipher)
         except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
             results[algorithm] = CmacSubkeyResult(algorithm, error=str(e))
             continue
@@ -389,26 +410,94 @@ def cmd_tr31_cmac_k1k2(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# cmac
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CmacResult:
+    mac: bytes = b""
+    error: str | None = None
+
+
+def _cmac_once(key: bytes, data: bytes, cipher: str) -> bytes:
+    """Compute CMAC (NIST SP 800-38B) tag over ``data``.
+
+    Parameters
+    ----------
+    key : bytes
+        The CMAC key.
+    data : bytes
+        Data to authenticate.
+    cipher : str
+        ``"TDES"`` or ``"AES"``.
+
+    Returns
+    -------
+    mac : bytes
+        CMAC tag (8 bytes for TDES, 16 bytes for AES).
+    """
+    block_size = 8 if cipher == "TDES" else 16
+    alg = psec.mac.Algorithm.DES if cipher == "TDES" else psec.mac.Algorithm.AES
+    k1, k2 = _derive_cmac_subkey_once(key, cipher)
+
+    remainder = len(data) % block_size
+    if remainder != 0 or len(data) == 0:
+        data = psec.mac.pad_iso_2(data, block_size)
+        last_subkey = k2
+    else:
+        last_subkey = k1
+
+    data = data[:-block_size] + psec.tools.xor(data[-block_size:], last_subkey)
+    return psec.mac.generate_cbc_mac(key, data, 1, block_size, alg)
+
+
+def do_tr31_cmac(key: bytes, data: bytes, cipher: str) -> CmacResult:
+    try:
+        return CmacResult(mac=_cmac_once(key, data, cipher))
+    except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
+        return CmacResult(error=str(e))
+
+
+def cmd_tr31_cmac(args: argparse.Namespace) -> None:
+    key = bytes.fromhex(args.key)
+    data = bytes.fromhex(args.data)
+    r = do_tr31_cmac(key, data, args.algo)
+    if r.error is not None:
+        print(f"error: {r.error}", file=sys.stderr)
+        sys.exit(1)
+    print(r.mac.hex().upper())
+
+
+# ---------------------------------------------------------------------------
 # derive-data
 # ---------------------------------------------------------------------------
+
+def _derive_data_blocks_once(vc: VersionCfg) -> dict[str, list[bytes]]:
+    """Derive input data blocks for a single ``VersionCfg``.
+
+    Returns ``{"enc": [...], "mac": [...]}`` — one data block per
+    counter/usage pair.
+    """
+    v, cfg = _lookup(vc)
+    blocks: dict[str, list[bytes]] = {"enc": [], "mac": []}
+    for counter in cfg.counters:
+        for usage_label, usage in [("enc", v.usage_enc),
+                                   ("mac", v.usage_mac)]:
+            data = _build_derive_data_block(
+                v.block_size, counter, usage, cfg.algo, cfg.keybits,
+            )
+            blocks[usage_label].append(data)
+    return blocks
+
 
 def do_tr31_derive_data() -> list[DeriveData]:
     result: list[DeriveData] = []
     for version_id, v in _VERSIONS.items():
         if v.method != "cmac":
             continue
-        for kbpk_bytes, cfg in v.kbpk_configs.items():
-            blocks: dict[str, list[bytes]] = {"enc": [], "mac": []}
-            for counter in cfg.counters:
-                for usage_label, usage in [("enc", v.usage_enc),
-                                           ("mac", v.usage_mac)]:
-                    data = _build_derive_data_block(
-                        v.block_size, counter, usage, cfg.algo, cfg.keybits,
-                    )
-                    blocks[usage_label].append(data)
-            result.append(DeriveData(
-                vc=VersionCfg(version_id, kbpk_bytes), blocks=blocks,
-            ))
+        for kbpk_bytes in v.kbpk_configs:
+            vc = VersionCfg(version_id, kbpk_bytes)
+            result.append(DeriveData(vc=vc, blocks=_derive_data_blocks_once(vc)))
     return result
 
 
@@ -438,61 +527,79 @@ def cmd_tr31_derive_data(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# manual KBEK/KBAK derivation (composed from cmac-k1k2 + derive-data)
+# manual KBEK/KBAK derivation (via cmac / xvariant)
 # ---------------------------------------------------------------------------
-
-def _derive_bde_pass(
-    kbpk: bytes, cipher: str, data_bytes: bytes, block_size: int, subkey: bytes,
-) -> bytes:
-    from psec import mac as _psec_mac, tools as _psec_tools
-
-    xor_data = _psec_tools.xor(data_bytes, subkey)
-
-    algorithm = psec.mac.Algorithm.DES if cipher == "TDES" else psec.mac.Algorithm.AES
-    return _psec_mac.generate_cbc_mac(
-        kbpk, xor_data, 1, block_size, algorithm,
-    )
-
 
 @dataclass
 class ConDeriveTrace(KbpkRow):
     subkey_name: str = ""
     subkey: bytes = b""
     passes: list[tuple[int, str, bytes, bytes]] = field(default_factory=list)
-    # (counter, usage_label, xor, pass_result) per CBC-MAC pass
+    # (counter, usage_label, xor, pass_result) per CMAC pass
+
+
+def _derive_kbek_kbak_cmac_once(kbpk: bytes, version_id: VersionId) -> ConDeriveTrace:
+    """Derive KBEK/KBAK for a single CMAC version.
+
+    Applies standard NIST CMAC to the raw (unpadded) derivation input
+    block.  Returns full trace including per-pass XOR data and
+    CMAC results.
+    """
+    vc = VersionCfg(version_id, len(kbpk))
+    v, cfg = _lookup(vc)
+    block_size = 8 if v.cipher == "TDES" else 16
+    k1, k2 = _derive_cmac_subkey_once(kbpk, v.cipher)
+
+    trace = ConDeriveTrace(
+        version_id=v.version_id,
+        description=cfg.description,
+        subkey_name=v.subkey,
+        subkey=k1 if v.subkey == "K1" else k2,
+    )
+    for counter in cfg.counters:
+        for usage_label, usage in [("enc", v.usage_enc),
+                                   ("mac", v.usage_mac)]:
+            raw_data = bytes([counter]) + usage + b"\x00" + cfg.algo + cfg.keybits
+            pass_bytes = _cmac_once(kbpk, raw_data, v.cipher)
+
+            # Reconstruct the XOR'd block for tracing
+            remainder = len(raw_data) % block_size
+            if remainder != 0:
+                padded = psec.mac.pad_iso_2(raw_data, block_size)
+                last_subkey = k2
+            else:
+                padded = raw_data
+                last_subkey = k1
+            xor_bytes = psec.tools.xor(padded[-block_size:], last_subkey)
+
+            trace.passes.append((counter, usage_label, xor_bytes, pass_bytes))
+            if usage_label == "enc":
+                trace.kbek += pass_bytes
+            else:
+                trace.kbak += pass_bytes
+
+    trace.kbek = trace.kbek[:len(kbpk)]
+    trace.kbak = trace.kbak[:len(kbpk)]
+    return trace
 
 
 def do_tr31_kbek_kbak_ver_derive(kbpk: bytes) -> dict[VersionId, ConDeriveTrace]:
-    data_by_vid = {d.vc.version_id: d for d in do_tr31_derive_data()
-                   if d.vc.kbpk_bytes == len(kbpk)}
-    cmac_subkeys = do_tr31_cmac_k1k2(kbpk)
-
     acc: dict[VersionId, ConDeriveTrace] = {}
-    for version_id, d in data_by_vid.items():
-        v, cfg = _lookup(d.vc)
-        algo = "DES" if v.cipher == "TDES" else v.cipher
-        subkey = cmac_subkeys[algo].k1 if v.subkey == "K1" else cmac_subkeys[algo].k2
-        acc[version_id] = ConDeriveTrace(
-            version_id=v.version_id,
-            description=cfg.description,
-            subkey_name=v.subkey,
-            subkey=subkey,
-        )
-        for i, counter in enumerate(cfg.counters):
-            for usage_label in ("enc", "mac"):
-                data = d.blocks[usage_label][i]
-                pass_bytes = _derive_bde_pass(kbpk, v.cipher, data, v.block_size, subkey)
-                xor_bytes = psec.tools.xor(data, subkey)
-                acc[version_id].passes.append((counter, usage_label, xor_bytes, pass_bytes))
-                if usage_label == "enc":
-                    acc[version_id].kbek += pass_bytes
-                else:
-                    acc[version_id].kbak += pass_bytes
-
-    for t in acc.values():
-        t.kbek = t.kbek[:len(kbpk)]
-        t.kbak = t.kbak[:len(kbpk)]
+    for version_id, v in _VERSIONS.items():
+        if v.method != "cmac":
+            continue
+        if len(kbpk) not in v.kbpk_configs:
+            continue
+        acc[version_id] = _derive_kbek_kbak_cmac_once(kbpk, version_id)
     return acc
+
+
+def _derive_kbek_kbak_xvariant_once(kbpk: bytes, version_id: VersionId) -> KbpkRow:
+    """Derive KBEK/KBAK for a single XOR-variant version."""
+    v = _VERSIONS[version_id]
+    bek = psec.tools.xor(kbpk, b"\x45" * len(kbpk))
+    bak = psec.tools.xor(kbpk, b"\x4D" * len(kbpk))
+    return KbpkRow(version_id, v.description, kbek=bek, kbak=bak)
 
 
 def do_tr31_kbek_kbak_ver_xvariant(kbpk: bytes) -> dict[VersionId, KbpkRow]:
@@ -500,12 +607,7 @@ def do_tr31_kbek_kbak_ver_xvariant(kbpk: bytes) -> dict[VersionId, KbpkRow]:
     for v in _VERSIONS.values():
         if v.method != "xvariant":
             continue
-        bek = psec.tools.xor(kbpk, b"\x45" * len(kbpk))
-        bak = psec.tools.xor(kbpk, b"\x4D" * len(kbpk))
-        rows[v.version_id] = KbpkRow(
-            v.version_id, v.description,
-            kbek=bek, kbak=bak,
-        )
+        rows[v.version_id] = _derive_kbek_kbak_xvariant_once(kbpk, v.version_id)
     return rows
 
 
@@ -599,6 +701,12 @@ def build_parser() -> argparse.ArgumentParser:
     cmac_k1k2 = tr31_sub.add_parser("cmac-k1k2", help="Derive CMAC subkeys K1/K2.")
     cmac_k1k2.add_argument("key", help="Key as a hex string.")
     cmac_k1k2.set_defaults(func=cmd_tr31_cmac_k1k2)
+
+    cmac = tr31_sub.add_parser("cmac", help="Compute CMAC (NIST SP 800-38B).")
+    cmac.add_argument("key", help="Key as a hex string.")
+    cmac.add_argument("data", help="Data to authenticate as a hex string.")
+    cmac.add_argument("algo", choices=["TDES", "AES"], help="Cipher algorithm.")
+    cmac.set_defaults(func=cmd_tr31_cmac)
 
     derive_data = tr31_sub.add_parser("derive-data", help="Derivation input data blocks for CMAC versions.")
     derive_data.set_defaults(func=cmd_tr31_derive_data)
