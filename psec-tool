@@ -264,6 +264,36 @@ def cmd_tr31_unwrap(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# wrap
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WrapResult:
+    key_block: str = ""
+    error: str | None = None
+
+
+def do_tr31_wrap(kbpk: bytes, header: str, key: bytes,
+                 masked_key_len: int | None = None) -> WrapResult:
+    try:
+        kb = psec.tr31.wrap(kbpk=kbpk, header=header, key=key,
+                            masked_key_len=masked_key_len)
+        return WrapResult(key_block=kb)
+    except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
+        return WrapResult(error=str(e))
+
+
+def cmd_tr31_wrap(args: argparse.Namespace) -> None:
+    kbpk = bytes.fromhex(args.kbpk)
+    key = bytes.fromhex(args.key)
+    r = do_tr31_wrap(kbpk, args.header, key, args.masked_key_len)
+    if r.error is not None:
+        print(f"error: {r.error}", file=sys.stderr)
+        sys.exit(1)
+    print(r.key_block)
+
+
+# ---------------------------------------------------------------------------
 # kbpk  (library KBEK / KBAK)
 # ---------------------------------------------------------------------------
 
@@ -542,6 +572,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unwrap.add_argument("key_block", help="TR-31 key block string to unwrap.")
     unwrap.set_defaults(func=cmd_tr31_unwrap)
+
+    wrap = tr31_sub.add_parser("wrap", help="Wrap a key into a TR-31 key block.")
+    wrap.add_argument(
+        "-k", "--kbpk", required=True,
+        help="Key Block Protection Key as a hex string.",
+    )
+    wrap.add_argument(
+        "header",
+        help="TR-31 key block header string (e.g. B0096P0TE00N0000).",
+    )
+    wrap.add_argument(
+        "key",
+        help="Key to wrap as a hex string.",
+    )
+    wrap.add_argument(
+        "-m", "--masked-key-len", type=int, default=None,
+        help="Desired key length in bytes to mask true key length.",
+    )
+    wrap.set_defaults(func=cmd_tr31_wrap)
 
     kbpk = tr31_sub.add_parser("kbpk", help="Derive KBEK/KBAK for all versions (via library).")
     kbpk.add_argument("-k", "--kbpk", required=True, help="Key Block Protection Key as a hex string.")
