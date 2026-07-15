@@ -405,9 +405,10 @@ def cmd_tr31_cmac_k1k2(args: argparse.Namespace) -> None:
         print(f"{algo}:")
         if r.error is not None:
             print(f"  n/a: {r.error}")
-        else:
-            print(f"  k1: {r.k1.hex().upper()}")
-            print(f"  k2: {r.k2.hex().upper()}")
+            continue
+        assert r.k1 is not None and r.k2 is not None
+        print(f"  k1: {r.k1.hex().upper()}")
+        print(f"  k2: {r.k2.hex().upper()}")
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +557,7 @@ def _gen_work_keycmac_once(kbpk: bytes, version_id: VersionId) -> CmacWorkKeyRes
     """
     vc = VersionCfg(version_id, len(kbpk))
     v, cfg = _lookup(vc)
+    assert v.algorithm is not None
     k1, k2 = _derive_cmac_subkey_once(kbpk, v.algorithm)
 
     data_blocks = _derive_data_blocks_once(vc)
