@@ -114,10 +114,6 @@ class Tr31Version:
     """Valid KBPK lengths (CMAC versions only). Keyed by ``kbpk_bytes``."""
 
 
-# derivation input initial bytearray templates
-_KD_INIT_DES = bytes.fromhex("0100000000000080")
-_KD_INIT_AES = bytes.fromhex("01000000000200808000000000000000")
-
 _VERSIONS: dict[VersionId, Tr31Version] = {
     VersionId.A: Tr31Version(
         version_id=VersionId.A, description="TDES Key Variant Binding Method",
@@ -189,12 +185,12 @@ def _lookup(vc: VersionCfg) -> tuple[Tr31Version, KbpkConfig]:
 def _build_derive_data_block(
     block_size: int, counter: int, usage: bytes, algo: bytes, keybits: bytes,
 ) -> bytes:
-    b = bytearray(_KD_INIT_DES if block_size == 8 else _KD_INIT_AES)
-    b[0] = counter
-    b[1:3] = usage
-    b[4:6] = algo
-    b[6:8] = keybits
-    return bytes(b)
+    data = bytes([counter]) + usage + b"\x00" + algo + keybits
+    # ISO 9797-1 method 2: append 0x80 then zero-fill to block_size
+    pad = block_size - (len(data) % block_size)
+    if pad != block_size:
+        data += b"\x80" + b"\x00" * (pad - 1)
+    return data
 
 
 # ---------------------------------------------------------------------------
