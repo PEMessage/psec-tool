@@ -316,10 +316,11 @@ def do_tr31_gen_header(
     """Build a TR-31 header string.
 
     Field rules (validated by ``psec.tr31.Header``, all ASCII alphanumeric):
-      version_id    : 1 char, one of A/B/C/D
+      version_id    : 1 char, one of A/B/C/D/E
                         A/C = TDES variant (deprecated),
                         B   = TDES key derivation (preferred TDES),
-                        D   = AES key derivation
+                        D   = AES key derivation,
+                        E   = AES key derivation (ISO 20038)
       key_usage     : 2 chars (e.g. P0=PIN encryption, M3=MAC, K0=KEK, ...)
       algorithm     : 1 char (e.g. T=TDES, A=AES, D=DES, R=RSA, ...)
       mode_of_use   : 1 char (e.g. E=encrypt, D=decrypt, B=both, N=none, ...)
@@ -353,6 +354,9 @@ def cmd_tr31_gen_header(args: argparse.Namespace) -> None:
             sys.exit(1)
         blocks.append((block_id, block_data))
 
+    if args.interactive:
+        _gen_header_interactive(args, blocks)
+
     r = do_tr31_gen_header(
         version_id=args.version_id,
         key_usage=args.key_usage,
@@ -365,6 +369,172 @@ def cmd_tr31_gen_header(args: argparse.Namespace) -> None:
     )
     _print_header(r.header)
     print(r.header_str)
+
+
+# ---------------------------------------------------------------------------
+# gen-header -i  (interactive mode)
+# ---------------------------------------------------------------------------
+
+# Known values from the psec.tr31 module docstring tables.
+# Interactive input is restricted to these values (numeric values
+# reserved for proprietary use must be passed via CLI options).
+
+_KEY_USAGE_TABLE: "dict[str, tuple[str, str]]" = {
+    # value: (description, valid modes of use)
+    "B0": ("BDK Base Derivation Key", "X"),
+    "B1": ("Initial DUKPT Key", "X"),
+    "B2": ("Base Key Variant Key", "X"),
+    "C0": ("CVK Card Verification Key", "CGV"),
+    "D0": ("Symmetric Key for Data Encryption", "BDE"),
+    "D1": ("Asymmetric Key for Data Encryption", "BDE"),
+    "D2": ("Data Encryption Key for Decimalization Table", "BDE"),
+    "E0": ("EMV/chip Issuer Master Key: Application cryptograms", "X"),
+    "E1": ("EMV/chip Issuer Master Key: Secure Messaging for Confidentiality", "X"),
+    "E2": ("EMV/chip Issuer Master Key: Secure Messaging for Integrity", "X"),
+    "E3": ("EMV/chip Issuer Master Key: Data Authentication Code", "X"),
+    "E4": ("EMV/chip Issuer Master Key: Dynamic Numbers", "X"),
+    "E5": ("EMV/chip Issuer Master Key: Card Personalization", "X"),
+    "E6": ("EMV/chip Issuer Master Key: Other", "X"),
+    "I0": ("Initialization Vector (IV)", "N"),
+    "K0": ("Key Encryption or wrapping", "BDE"),
+    "K1": ("TR-31 Key Block Protection Key", "BDE"),
+    "K2": ("TR-34 Asymmetric key", "BDE"),
+    "K3": ("Asymmetric key for key agreement/key wrapping", "BDEX"),
+    "M0": ("ISO 16609 MAC algorithm 1 (using TDEA)", "CGV"),
+    "M1": ("ISO 9797-1 MAC Algorithm 1", "CGV"),
+    "M2": ("ISO 9797-1 MAC Algorithm 2", "CGV"),
+    "M3": ("ISO 9797-1 MAC Algorithm 3", "CGV"),
+    "M4": ("ISO 9797-1 MAC Algorithm 4", "CGV"),
+    "M5": ("ISO 9797-1:1999 MAC Algorithm 5", "CGV"),
+    "M6": ("ISO 9797-1:2011 MAC Algorithm 5/CMAC", "CGV"),
+    "M7": ("HMAC", "CGV"),
+    "M8": ("ISO 9797-1:2011 MAC Algorithm 6", "CGV"),
+    "P0": ("PIN Encryption", "BDE"),
+    "S0": ("Asymmetric key pair for digital signature", "SV"),
+    "S1": ("Asymmetric key pair, CA key", "SV"),
+    "S2": ("Asymmetric key pair, non-X9.24 key", "SVTBDE"),
+    "V0": ("PIN verification, KPV, other algorithm", "CGV"),
+    "V1": ("PIN verification, IBM 3624", "CGV"),
+    "V2": ("PIN Verification, VISA PVV", "CGV"),
+    "V3": ("PIN Verification, X9.132 algorithm 1", "CGV"),
+    "V4": ("PIN Verification, X9.132 algorithm 2", "CGV"),
+}
+
+_ALGORITHM_TABLE = {
+    "A": "AES",
+    "D": "DES (included for backwards compatibility)",
+    "E": "Elliptic Curve",
+    "H": "HMAC (specify the underlying hash algorithm in optional block)",
+    "R": "RSA",
+    "S": "DSA",
+    "T": "Triple DES (TDES)",
+}
+
+_MODE_OF_USE_TABLE = {
+    "B": "Both Encrypt & Decrypt / Wrap & Unwrap",
+    "C": "Both Generate & Verify",
+    "D": "Decrypt / Unwrap Only",
+    "E": "Encrypt / Wrap Only",
+    "G": "Generate Only",
+    "N": "No special restrictions other than restrictions implied by the Key Usage",
+    "S": "Signature Only",
+    "T": "Both Sign & Decrypt",
+    "V": "Verify Only",
+    "X": "Key used to derive other key(s)",
+    "Y": "Key used to create key variants",
+}
+
+_EXPORTABILITY_TABLE = {
+    "E": "Exportable under trusted key",
+    "N": "Not exportable",
+    "S": "Sensitive, exportable under untrusted key",
+}
+
+_VERSION_ID_TABLE = {
+    "A": "TDES variant. Deprecated and should not be used for new applications.",
+    "B": "TDES key derivation. Preferred TDES implementation.",
+    "C": "TDES variant. Same as A.",
+    "D": "AES key derivation",
+    "E": "AES key derivation (ISO 20038)",
+}
+
+
+def _prompt(label: str, default: str, table: dict[str, str] | None = None) -> str:
+    if table is None:
+        value = input(f"{label} [{default}]: ").strip()
+        return value if value else default
+
+    values = list(table)
+    for i, (value, description) in enumerate(table.items(), 1):
+        print(f"  {i:>2}) {value:<2} - {description}")
+    while True:
+        value = input(f"{label} (value or number) [{default}]: ").strip()
+        if not value:
+            return default
+        if value.isdigit() and 1 <= int(value) <= len(values):
+            return values[int(value) - 1]
+        if value in table:
+            return value
+        print(f"  error: '{value}' is not a valid choice")
+
+
+def _mode_of_use_choices(key_usage: str) -> dict[str, str]:
+    """Modes of use allowed for ``key_usage``.
+
+    Falls back to the full table for unknown (e.g. proprietary numeric)
+    key usage values.
+    """
+    if key_usage not in _KEY_USAGE_TABLE:
+        return dict(_MODE_OF_USE_TABLE)
+    valid_modes = _KEY_USAGE_TABLE[key_usage][1]
+    return {
+        value: description
+        for value, description in _MODE_OF_USE_TABLE.items()
+        if value in valid_modes
+    }
+
+
+def _gen_header_interactive(args: argparse.Namespace,
+                            blocks: list[tuple[str, str]]) -> None:
+    """Fill ``args`` fields by prompting. CLI values are the defaults."""
+    print("-- version id --")
+    args.version_id = _prompt("version id", args.version_id, _VERSION_ID_TABLE)
+    print("-- key usage --")
+    key_usage_table = {
+        value: f"{description:<65} (mode of use: {'/'.join(modes)})"
+        for value, (description, modes) in _KEY_USAGE_TABLE.items()
+    }
+    args.key_usage = _prompt("key usage", args.key_usage, key_usage_table)
+    print("-- algorithm --")
+    args.algorithm = _prompt("algorithm", args.algorithm, _ALGORITHM_TABLE)
+    print("-- mode of use --")
+    mode_of_use_table = _mode_of_use_choices(args.key_usage)
+    if len(mode_of_use_table) != len(_MODE_OF_USE_TABLE):
+        print(f"  (restricted by key usage {args.key_usage})")
+    args.mode_of_use = _prompt("mode of use", args.mode_of_use, mode_of_use_table)
+    print("-- version num --")
+    print("  00 - key versioning is not used")
+    print("  c? - the key block carries a component of a key")
+    print("  ?? - any other value: version of the key")
+    args.version_num = _prompt("version num", args.version_num)
+    print("-- exportability --")
+    args.exportability = _prompt("exportability", args.exportability, _EXPORTABILITY_TABLE)
+
+    print("-- optional blocks --")
+    while True:
+        spec = input("optional block ID=DATA (empty to finish): ").strip()
+        if not spec:
+            break
+        block_id, sep, block_data = spec.partition("=")
+        if not sep:
+            print("  invalid block spec, expected ID=DATA")
+            continue
+        blocks.append((block_id, block_data))
+
+    print("-- key length --")
+    key_len = input("key length in bytes (empty to skip): ").strip()
+    args.key_len = int(key_len) if key_len else None
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -775,9 +945,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     gen_header = tr31_sub.add_parser("gen-header", help="Generate a TR-31 key block header string.")
     gen_header.add_argument(
-        "-v", "--version-id", default="B", choices=["A", "B", "C", "D"],
+        "-i", "--interactive", action="store_true",
+        help="Prompt for each field interactively. "
+        "Other options provide the defaults; prompted blocks are appended to -b.",
+    )
+    gen_header.add_argument(
+        "-v", "--version-id", default="B", choices=["A", "B", "C", "D", "E"],
         help="Key block version ID: A/C=TDES variant (deprecated), "
-        "B=TDES key derivation (preferred), D=AES key derivation. Default: B.",
+        "B=TDES key derivation (preferred), D=AES key derivation, "
+        "E=AES key derivation (ISO 20038). Default: B.",
     )
     gen_header.add_argument(
         "-u", "--key-usage", default="00",

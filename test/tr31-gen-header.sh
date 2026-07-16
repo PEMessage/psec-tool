@@ -54,3 +54,47 @@ if [ $? -ne 0 ]; then
 fi
 set -eo pipefail
 echo "PASS: invalid block spec error"
+
+# Interactive mode: fields answered via stdin, empty answers keep defaults
+HEADER3=$(printf 'D\nP0\nA\nE\n\nE\nKS=00604B120F9292800000\n\n24\n' \
+    | ./psec-tool tr31 gen-header -i | tail -1)
+echo "header: $HEADER3"
+
+if [ "$HEADER3" != "D0144P0AE00E0200KS1800604B120F9292800000PB080000" ]; then
+    echo "FAIL: unexpected interactive header, got $HEADER3"
+    exit 1
+fi
+echo "PASS: interactive mode"
+
+# Interactive mode: empty answers fall back to CLI option defaults
+HEADER4=$(printf '\n\n\n\n\n\n\n\n' \
+    | ./psec-tool tr31 gen-header -i -v B -u P0 -a T -m E | tail -1)
+echo "header: $HEADER4"
+
+if [ "$HEADER4" != "B0016P0TE00N0000" ]; then
+    echo "FAIL: unexpected interactive default header, got $HEADER4"
+    exit 1
+fi
+echo "PASS: interactive defaults from CLI options"
+
+# Interactive mode: select by menu number (4=D, 29=P0, 1=A, 3=E, 2=N)
+HEADER5=$(printf '4\n29\n1\n3\n\n2\n\n\n' \
+    | ./psec-tool tr31 gen-header -i | tail -1)
+echo "header: $HEADER5"
+
+if [ "$HEADER5" != "D0016P0AE00N0000" ]; then
+    echo "FAIL: unexpected numbered-selection header, got $HEADER5"
+    exit 1
+fi
+echo "PASS: interactive numbered selection"
+
+# Interactive mode: invalid choice is rejected and re-prompted
+HEADER6=$(printf 'Z\nD\nP0\nA\nE\n\nE\n\n\n' \
+    | ./psec-tool tr31 gen-header -i | tail -1)
+echo "header: $HEADER6"
+
+if [ "$HEADER6" != "D0016P0AE00E0000" ]; then
+    echo "FAIL: unexpected header after invalid choice, got $HEADER6"
+    exit 1
+fi
+echo "PASS: interactive invalid choice re-prompt"
