@@ -216,14 +216,29 @@ class CmacSubkeyResult:
 # unwrap
 # ---------------------------------------------------------------------------
 
+def _key_usage_desc(ku: str) -> str:
+    """Resolve key-usage description from the existing ``_KEY_USAGE_TABLE``."""
+    entry = _KEY_USAGE_TABLE.get(ku)
+    return entry[0] if entry is not None else "proprietary"
+
+
+def _version_num_desc(vn: str) -> str:
+    if vn == "00":
+        return "No key versioning"
+    elif vn[0] in ("c", "C"):
+        return "Component of a key"
+    else:
+        return f"Key version '{vn}'"
+
+
 def _print_header(header: "psec.tr31.Header") -> None:
     print(f"header: {header}")
-    print(f"  version_id:    {header.version_id}")
-    print(f"  key_usage:     {header.key_usage}")
-    print(f"  algorithm:     {header.algorithm}")
-    print(f"  mode_of_use:   {header.mode_of_use}")
-    print(f"  version_num:   {header.version_num}")
-    print(f"  exportability: {header.exportability}")
+    print(f"  version_id:    {header.version_id}  ({_VERSION_ID_TABLE.get(header.version_id, 'proprietary')})")
+    print(f"  key_usage:     {header.key_usage}  ({_key_usage_desc(header.key_usage)})")
+    print(f"  algorithm:     {header.algorithm}  ({_ALGORITHM_TABLE.get(header.algorithm, 'proprietary')})")
+    print(f"  mode_of_use:   {header.mode_of_use}  ({_MODE_OF_USE_TABLE.get(header.mode_of_use, 'proprietary')})")
+    print(f"  version_num:   {header.version_num}  ({_version_num_desc(header.version_num)})")
+    print(f"  exportability: {header.exportability}  ({_EXPORTABILITY_TABLE.get(header.exportability, 'proprietary')})")
     print(f"  blocks:        {len(header.blocks)}")
     for block_id, block_data in header.blocks.items():
         print(f"    block[{block_id}]:   {block_data}")
