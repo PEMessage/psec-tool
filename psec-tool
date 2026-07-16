@@ -294,6 +294,80 @@ def cmd_tr31_wrap(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# gen-header
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GenHeaderResult:
+    header: "psec.tr31.Header"
+    header_str: str
+
+
+def do_tr31_gen_header(
+    version_id: str,
+    key_usage: str,
+    algorithm: str,
+    mode_of_use: str,
+    version_num: str,
+    exportability: str,
+    blocks: list[tuple[str, str]],
+    key_len: int | None = None,
+) -> GenHeaderResult:
+    """Build a TR-31 header string.
+
+    Field rules (validated by ``psec.tr31.Header``, all ASCII alphanumeric):
+      version_id    : 1 char, one of A/B/C/D
+                        A/C = TDES variant (deprecated),
+                        B   = TDES key derivation (preferred TDES),
+                        D   = AES key derivation
+      key_usage     : 2 chars (e.g. P0=PIN encryption, M3=MAC, K0=KEK, ...)
+      algorithm     : 1 char (e.g. T=TDES, A=AES, D=DES, R=RSA, ...)
+      mode_of_use   : 1 char (e.g. E=encrypt, D=decrypt, B=both, N=none, ...)
+      version_num   : 2 chars (key version number, "00" = none)
+      exportability : 1 char (e.g. E=exportable, N=non-exportable, S=sensitive)
+
+    When ``key_len`` (bytes of the key to be wrapped) is given, the length
+    field is the final key block length via ``Header.dump``; otherwise it is
+    the bare header length (16 + optional blocks) via ``str(header)``.
+    """
+    header = psec.tr31.Header(
+        version_id=version_id,
+        key_usage=key_usage,
+        algorithm=algorithm,
+        mode_of_use=mode_of_use,
+        version_num=version_num,
+        exportability=exportability,
+    )
+    for block_id, block_data in blocks:
+        header.blocks[block_id] = block_data
+    header_str = header.dump(key_len) if key_len is not None else str(header)
+    return GenHeaderResult(header=header, header_str=header_str)
+
+
+def cmd_tr31_gen_header(args: argparse.Namespace) -> None:
+    blocks: list[tuple[str, str]] = []
+    for spec in args.block or []:
+        block_id, sep, block_data = spec.partition("=")
+        if not sep:
+            print(f"error: invalid block spec '{spec}', expected ID=DATA", file=sys.stderr)
+            sys.exit(1)
+        blocks.append((block_id, block_data))
+
+    r = do_tr31_gen_header(
+        version_id=args.version_id,
+        key_usage=args.key_usage,
+        algorithm=args.algorithm,
+        mode_of_use=args.mode_of_use,
+        version_num=args.version_num,
+        exportability=args.exportability,
+        blocks=blocks,
+        key_len=args.key_len,
+    )
+    _print_header(r.header)
+    print(r.header_str)
+
+
+# ---------------------------------------------------------------------------
 # kbpk  (library KBEK / KBAK)
 # ---------------------------------------------------------------------------
 
@@ -698,6 +772,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Desired key length in bytes to mask true key length.",
     )
     wrap.set_defaults(func=cmd_tr31_wrap)
+
+    gen_header = tr31_sub.add_parser("gen-header", help="Generate a TR-31 key block header string.")
+    gen_header.add_argument(
+        "-v", "--version-id", default="B", choices=["A", "B", "C", "D"],
+        help="Key block version ID: A/C=TDES variant (deprecated), "
+        "B=TDES key derivation (preferred), D=AES key derivation. Default: B.",
+    )
+    gen_header.add_argument(
+        "-u", "--key-usage", default="00",
+        help="Intended function of the key, 2 chars "
+        "(e.g. P0=PIN encryption, M3=MAC, K0=KEK, D0=data encryption). Default: 00.",
+    )
+    gen_header.add_argument(
+        "-a", "--algorithm", default="0",
+        help="Approved algorithm for the protected key, 1 char "
+        "(e.g. T=TDES, A=AES, D=DES, R=RSA, H=HMAC). Default: 0.",
+    )
+    gen_header.add_argument(
+        "-m", "--mode-of-use", default="0",
+        help="Operation the protected key can perform, 1 char "
+        "(e.g. E=encrypt, D=decrypt, B=both, G=generate, V=verify, N=none). Default: 0.",
+    )
+    gen_header.add_argument(
+        "-n", "--version-num", default="00",
+        help="Key version number, 2 chars. Not to be confused with version ID. Default: 00.",
+    )
+    gen_header.add_argument(
+        "-e", "--exportability", default="N",
+        help="Whether the key may leave the cryptographic domain, 1 char "
+        "(E=exportable, N=non-exportable, S=sensitive). Default: N.",
+    )
+    gen_header.add_argument(
+        "-b", "--block", action="append", metavar="ID=DATA",
+        help="Optional block as ID=DATA (e.g. KS=00604B120F9292800000). Repeatable.",
+    )
+    gen_header.add_argument(
+        "-l", "--key-len", type=int, default=None,
+        help="Length in bytes of the key to be wrapped. If given, the header "
+        "length field reflects the final key block length; otherwise only the header itself.",
+    )
+    gen_header.set_defaults(func=cmd_tr31_gen_header)
 
     kbpk = tr31_sub.add_parser("kbpk", help="Derive KBEK/KBAK for all versions (via library).")
     kbpk.add_argument("-k", "--kbpk", required=True, help="Key Block Protection Key as a hex string.")
