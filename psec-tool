@@ -695,45 +695,107 @@ _VERSION_BLOCK_SIZE = {
 }
 
 
+def _build_padded(version: str, payload: bytes,
+                  masked_key_len: int | None = None) -> tuple[bytes, int, int]:
+    """Build ``key_len_bits(2) + payload + padding`` .
+
+    Returns ``(padded, pad_len, extra_pad)``.
+    Padding is zero-filled for deterministic display
+    (actual TR-31 uses ``os.urandom``).
+    """
+    block_size = _VERSION_BLOCK_SIZE.get(version)
+    actual_len = len(payload)
+    target_len = max(actual_len, masked_key_len or actual_len)
+    extra_pad = target_len - actual_len
+    overhead = 2  # key-len-bits
+
+    if block_size is None:
+        pad_len = 0
+    else:
+        remainder = (overhead + actual_len + extra_pad) % block_size
+        pad_len = block_size - remainder if remainder != 0 else 0
+
+    key_len_bits = (len(payload) * 8).to_bytes(2, "big")
+    padding = b"\x00" * (pad_len + extra_pad)
+    return (key_len_bits + payload + padding, pad_len, extra_pad)
+
+
 def cmd_tr31_padding(args: argparse.Namespace) -> None:
     """Show the key-data block that TR-31 feeds to encryption.
 
     TR-31 key data layout::
 
-        2 bytes  key-length in bits (big-endian)
-        N bytes  the actual key / payload
-        M bytes  padding (ISO 9797-1 method-2) to fill to block_size
+         2 bytes  key-length in bits (big-endian)
+         N bytes  the actual key / payload
+         M bytes  random padding that fills to the version's block size
+                   + optional extra masking bytes (``-m masked_key_len``)
 
-    Version E (AES-CTR) does not require padding — the key data is
-    encrypted directly without block alignment.
+    The prefix encodes the real key length so the decryptor knows
+    exactly where the key ends; everything after the prefix + key is
+    padding and is discarded on unwrap.
+
+    Version E (AES-CTR) does not require block-alignment padding.
     """
-    block_size = _VERSION_BLOCK_SIZE.get(args.version)
-    ctr_mode = block_size is None
-
     payload = bytes.fromhex(args.payload)
-    key_len_bits = (len(payload) * 8).to_bytes(2, "big")
-    overhead_plus_payload = key_len_bits + payload
+    padded, pad_len, extra_pad = _build_padded(args.version, payload, args.masked_key_len)
 
-    if ctr_mode:
-        padded = overhead_plus_payload
-        pad_len = 0
-    else:
-        padded = psec.mac.pad_iso_2(overhead_plus_payload, block_size)
-        pad_len = len(padded) - len(overhead_plus_payload)
+    key_len_bits = padded[:2]
+    block_size = _VERSION_BLOCK_SIZE.get(args.version)
+    total_pad = pad_len + extra_pad
 
-    print(f"version:      {args.version}  ({_VERSION_ID_TABLE[args.version]})")
-    if not ctr_mode:
-        print(f"block_size:   {block_size} bytes")
+    print(f"version:        {args.version}  ({_VERSION_ID_TABLE[args.version]})")
+    if extra_pad:
+        print(f"masked_key_len: {args.masked_key_len} bytes  (real: {len(payload)} bytes)")
+    if block_size is not None:
+        print(f"block_size:     {block_size} bytes")
     else:
-        print(f"mode:         AES-CTR (no padding required)")
-    print(f"payload:      {payload.hex().upper()} ({len(payload)} bytes)")
-    print(f"key-len-bits: {key_len_bits.hex().upper()} (2 bytes)")
-    print(f"pad_len:      {pad_len} bytes")
+        print(f"mode:           AES-CTR (no padding required)")
+    print(f"key-len-bits:   {key_len_bits.hex().upper()} (2 bytes)")
+    print(f"payload:        {payload.hex().upper()} ({len(payload)} bytes)")
+    print(f"pad_len:        {pad_len} bytes  (block alignment)")
+    print(f"extra_pad:      {extra_pad} bytes  (length masking)")
+    print(f"total_pad:      {total_pad} bytes")
     print()
-    print(f"  [overhead+payload]: {overhead_plus_payload.hex().upper()}")
-    if not ctr_mode:
-        print(f"  [+ padding]:        {padded[-pad_len:].hex().upper()}")
-    print(f"  clear_key_data:     {padded.hex().upper()}")
+    print(f"  [key-len-bits]:       {key_len_bits.hex().upper()}")
+    print(f"  [payload]:            {payload.hex().upper()}")
+    if total_pad > 0:
+        print(f"  [padding]:            {padded[len(key_len_bits)+len(payload):].hex().upper()}")
+    print(f"  clear_key_data:       {padded.hex().upper()}")
+
+
+# ---------------------------------------------------------------------------
+# unpadding
+# ---------------------------------------------------------------------------
+
+def cmd_tr31_unpadding(args: argparse.Namespace) -> None:
+    """Unwrap the key from a TR-31 clear-key-data block.
+
+    Reads the 2-byte key-length-in-bits prefix, extracts that many
+    bytes as the real key, and shows the padding tail.
+    """
+    data = bytes.fromhex(args.clear_key_data)
+
+    if len(data) < 2:
+        print("error: clear_key_data must be at least 2 bytes", file=sys.stderr)
+        sys.exit(1)
+
+    key_len_bits = int.from_bytes(data[:2], "big")
+    key_len_bytes = key_len_bits // 8
+    key = data[2: 2 + key_len_bytes]
+    padding = data[2 + key_len_bytes:]
+
+    if key_len_bits % 8 != 0:
+        print(f"warning: key-length {key_len_bits} bits is not a whole number of bytes",
+              file=sys.stderr)
+
+    version_desc = _VERSION_ID_TABLE.get(args.version, "proprietary")
+    print(f"version:        {args.version}  ({version_desc})")
+    print(f"key-len-bits:   {data[:2].hex().upper()}  => {key_len_bits} bits = {key_len_bytes} bytes")
+    print(f"key:            {key.hex().upper()} ({len(key)} bytes)")
+    print(f"padding:        {padding.hex().upper()} ({len(padding)} bytes)")
+    if len(key) != key_len_bytes:
+        print(f"warning: data truncated (expected {key_len_bytes} bytes, got {len(key)})",
+              file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1046,8 +1108,16 @@ def build_parser() -> argparse.ArgumentParser:
     padding = tr31_sub.add_parser("padding", help="Show padded key-data block fed to TR-31 encryption.")
     padding.add_argument("-v", "--version", required=True, choices=["A", "B", "C", "D", "E"],
                          help="TR-31 version ID (determines block size).")
+    padding.add_argument("-m", "--masked-key-len", type=int, default=None,
+                         help="Masked key length in bytes (default: actual key length).")
     padding.add_argument("payload", help="Payload bytes as a hex string.")
     padding.set_defaults(func=cmd_tr31_padding)
+
+    unpadding = tr31_sub.add_parser("unpadding", help="Extract key from a TR-31 clear-key-data block.")
+    unpadding.add_argument("-v", "--version", required=True, choices=["A", "B", "C", "D", "E"],
+                           help="TR-31 version ID (informational, does not affect extraction).")
+    unpadding.add_argument("clear_key_data", help="Clear key data hex (key-len-bits + key + padding).")
+    unpadding.set_defaults(func=cmd_tr31_unpadding)
 
     derive_data = tr31_sub.add_parser("derive-data", help="Derivation input data blocks for CMAC versions.")
     derive_data.set_defaults(func=cmd_tr31_derive_data)
