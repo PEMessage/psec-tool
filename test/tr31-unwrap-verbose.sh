@@ -8,7 +8,7 @@ KEY="CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD"
 
 for ver in A B C; do
   header="${ver}0016P0TE00N0000"
-  KB=$(./psec-tool tr31 wrap -k "$K_TDES" "$header" "$KEY" 2>/dev/null)
+  KB=$(./psec-tool tr31 wrap -k "$K_TDES" -H "$header" "$KEY" 2>/dev/null)
   RESULT=$(./psec-tool tr31 unwrap-verbose -k "$K_TDES" "$KB" 2>/dev/null)
   echo "$RESULT" | grep -q "MAC match:.*OK" || { echo "FAIL: V$ver MAC not OK"; exit 1; }
   KEY_OUT=$(echo "$RESULT" | grep "key:" | head -1 | awk '{print $2}')
@@ -22,7 +22,7 @@ done
 
 for ver in D E; do
   header="${ver}0016P0AE00N0000"
-  KB=$(./psec-tool tr31 wrap -k "$K_AES" "$header" "$KEY" 2>/dev/null)
+  KB=$(./psec-tool tr31 wrap -k "$K_AES" -H "$header" "$KEY" 2>/dev/null)
   RESULT=$(./psec-tool tr31 unwrap-verbose -k "$K_AES" "$KB" 2>/dev/null)
   echo "$RESULT" | grep -q "MAC match:.*OK" || { echo "FAIL: V$ver MAC not OK"; exit 1; }
   KEY_OUT=$(echo "$RESULT" | grep "key:" | head -1 | awk '{print $2}')

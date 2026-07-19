@@ -25,7 +25,7 @@ echo "PASS: optional block + key-len"
 # Roundtrip: generated header must be accepted by wrap/unwrap
 KBPK="ABABABABABABABABABABABABABABABAB"
 KEY="CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD"
-WRAPPED=$(./psec-tool tr31 wrap -k "$KBPK" "$HEADER" "$KEY")
+WRAPPED=$(./psec-tool tr31 wrap -k "$KBPK" -H "$HEADER" "$KEY")
 echo "wrapped: $WRAPPED"
 UNWRAPPED=$(./psec-tool tr31 unwrap -k "$KBPK" "$WRAPPED" 2>/dev/null | grep '^key:' | awk '{print $2}')
 

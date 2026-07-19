@@ -1851,7 +1851,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Key Block Protection Key as a hex string.",
     )
     wrap.add_argument(
-        "header",
+        "-H", "--header", required=True,
         help="TR-31 key block header string (e.g. B0096P0TE00N0000).",
     )
     wrap.add_argument(
@@ -1948,7 +1948,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     wrapv = tr31_sub.add_parser("wrap-verbose", help="Verbose TR-31 key wrap with all intermediate values (versions A-E).")
     wrapv.add_argument("-k", "--kbpk", required=True, help="Key Block Protection Key as a hex string.")
-    wrapv.add_argument("header", help="TR-31 key block header string.")
+    wrapv.add_argument("-H", "--header", required=True, help="TR-31 key block header string.")
     wrapv.add_argument("key", help="Key to wrap as a hex string.")
     wrapv.add_argument(
         "-m", "--masked-key-len", type=int, default=None,
