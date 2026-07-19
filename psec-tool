@@ -9,6 +9,7 @@
 import argparse
 import sys
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -1003,6 +1004,462 @@ def cmd_tr31_kbek_kbak(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# wrap-verbose  (verbose TR-31 key wrap, versions A-E)
+# ---------------------------------------------------------------------------
+
+def _wrapv_build_header(hdr: "psec.tr31.Header", masked_key_len: int) -> str:
+    """Build the final header string via Header.dump()."""
+    return hdr.dump(masked_key_len)
+
+
+def _wrapv_resolve_masked_len(key: bytes, algorithm: str,
+                              masked_key_len: int | None) -> int:
+    if masked_key_len is None:
+        default_max = 24 if algorithm == "T" or algorithm == "D" else 32
+        return max(default_max, len(key))
+    return max(masked_key_len, len(key))
+
+
+def _wrapv_clear_key(key: bytes, extra_pad: int, block_size: int,
+                     padding_mode: str = "zero") -> tuple[bytes, int, int, bytes, bytes]:
+    """Build clear key data: key_len_bits(2) + key + padding.
+
+    Returns (clear_key_data, pad_len, total_pad, key_len_bits, padding_bytes).
+    Block alignment padding is only applied when block_size > 0.
+
+    padding_mode:
+      "zero"   - zero-fill (deterministic, shows structure)
+      "random" - os.urandom (matches library default)
+    """
+    import os
+    key_len_bits = (len(key) * 8).to_bytes(2, "big")
+    if block_size > 0:
+        pad_len = block_size - ((2 + len(key) + extra_pad) % block_size)
+    else:
+        pad_len = 0
+    total_pad = pad_len + extra_pad
+    if padding_mode == "random":
+        padding = os.urandom(total_pad)
+    else:
+        padding = b"\x00" * total_pad
+    return key_len_bits + key + padding, pad_len, total_pad, key_len_bits, padding
+
+
+# ---------------------------------------------------------------------------
+# Version A / C: TDES variant (XOR keys + CBC-MAC-on-enc-key)
+# ---------------------------------------------------------------------------
+
+
+def _wrapv_ac(kbpk: bytes, header_dump: str, key: bytes, extra_pad: int,
+              padding_mode: str = "zero") -> dict[str, object]:
+    img: dict[str, object] = {}
+
+    variant_enc = b"\x45" * len(kbpk)
+    variant_mac = b"\x4D" * len(kbpk)
+    kbek = psec.tools.xor(kbpk, variant_enc)
+    kbak = psec.tools.xor(kbpk, variant_mac)
+    img["method"] = "variant"
+    img["variant_enc"] = variant_enc
+    img["variant_mac"] = variant_mac
+    img["kbek"] = kbek
+    img["kbak"] = kbak
+
+    clear_key_data, pad_len, total_pad, key_len_bits, padding = _wrapv_clear_key(
+        key, extra_pad, 8, padding_mode,
+    )
+    img["key_len_bits"] = key_len_bits
+    img["pad_len"] = pad_len
+    img["total_pad"] = total_pad
+    img["clear_key_data"] = clear_key_data
+
+    iv = header_dump.encode("ascii")[:8]
+    enc_key = psec.des.encrypt_tdes_cbc(kbek, iv, clear_key_data)
+    img["iv"] = iv
+    img["enc_key"] = enc_key
+
+    mac_data = header_dump.encode("ascii") + enc_key
+    mac = psec.mac.generate_cbc_mac(kbak, mac_data, 1, 4, psec.mac.Algorithm.DES)
+    img["mac"] = mac
+    img["mac_data_bytes"] = mac_data
+
+    img["key_block"] = header_dump + enc_key.hex().upper() + mac.hex().upper()
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Version B: TDES CMAC derivation + TDES-CBC (MAC as IV)
+# ---------------------------------------------------------------------------
+
+
+def _wrapv_b(kbpk: bytes, header_dump: str, key: bytes, extra_pad: int,
+             padding_mode: str = "zero") -> dict[str, object]:
+    img: dict[str, object] = {}
+    cmac_r = _gen_work_keycmac_once(kbpk, VersionId.B)
+    kbek, kbak = cmac_r.kbek, cmac_r.kbak
+    img["method"] = "cmac"
+    img["algorithm"] = Algorithm.TDES
+    img["subkey_name"] = cmac_r.subkey_name
+    img["subkey"] = cmac_r.subkey
+    img["kbek"] = kbek
+    img["kbak"] = kbak
+    img["cmac_passes"] = cmac_r.passes
+
+    clear_key_data, pad_len, total_pad, key_len_bits, padding = _wrapv_clear_key(
+        key, extra_pad, 8, padding_mode,
+    )
+    img["key_len_bits"] = key_len_bits
+    img["pad_len"] = pad_len
+    img["total_pad"] = total_pad
+    img["clear_key_data"] = clear_key_data
+
+    k1, _ = psec.tr31.KeyBlock(kbpk=b"\x00" * 16)._derive_des_cmac_subkey(kbak)
+    mac_data_full = header_dump.encode("ascii") + clear_key_data
+    mac_data_xor = mac_data_full[:-8] + psec.tools.xor(mac_data_full[-8:], k1)
+    mac = psec.mac.generate_cbc_mac(kbak, mac_data_xor, 1, 8, psec.mac.Algorithm.DES)
+    img["mac_k1"] = k1
+    img["mac_data_full"] = mac_data_full
+    img["mac_data_xor"] = mac_data_xor
+    img["mac"] = mac
+
+    enc_key = psec.des.encrypt_tdes_cbc(kbek, mac, clear_key_data)
+    img["iv_mac"] = mac
+    img["enc_key"] = enc_key
+
+    img["key_block"] = header_dump + enc_key.hex().upper() + mac.hex().upper()
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Version D: AES CMAC derivation + AES-CBC (MAC as IV)
+# ---------------------------------------------------------------------------
+
+
+def _wrapv_d(kbpk: bytes, header_dump: str, key: bytes, extra_pad: int,
+             padding_mode: str = "zero") -> dict[str, object]:
+    img: dict[str, object] = {}
+    cmac_r = _gen_work_keycmac_once(kbpk, VersionId.D)
+    kbek, kbak = cmac_r.kbek, cmac_r.kbak
+    img["method"] = "cmac"
+    img["algorithm"] = Algorithm.AES
+    img["subkey_name"] = cmac_r.subkey_name
+    img["subkey"] = cmac_r.subkey
+    img["kbek"] = kbek
+    img["kbak"] = kbak
+    img["cmac_passes"] = cmac_r.passes
+
+    clear_key_data, pad_len, total_pad, key_len_bits, padding = _wrapv_clear_key(
+        key, extra_pad, 16, padding_mode,
+    )
+    img["key_len_bits"] = key_len_bits
+    img["pad_len"] = pad_len
+    img["total_pad"] = total_pad
+    img["clear_key_data"] = clear_key_data
+
+    k1, _ = psec.tr31.KeyBlock(kbpk=b"\x00" * 16)._derive_aes_cmac_subkey(kbak)
+    mac_data_full = header_dump.encode("ascii") + clear_key_data
+    mac_data_xor = mac_data_full[:-16] + psec.tools.xor(mac_data_full[-16:], k1)
+    mac = psec.mac.generate_cbc_mac(kbak, mac_data_xor, 1, 16, psec.mac.Algorithm.AES)
+    img["mac_k1"] = k1
+    img["mac_data_full"] = mac_data_full
+    img["mac_data_xor"] = mac_data_xor
+    img["mac"] = mac
+
+    enc_key = psec.aes.encrypt_aes_cbc(kbek, mac, clear_key_data)
+    img["iv_mac"] = mac
+    img["enc_key"] = enc_key
+
+    img["key_block"] = header_dump + enc_key.hex().upper() + mac.hex().upper()
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Version E: AES CMAC derivation + AES-CTR (MAC as nonce)
+# ---------------------------------------------------------------------------
+
+
+def _wrapv_e(kbpk: bytes, header_dump: str, key: bytes, extra_pad: int,
+             padding_mode: str = "zero") -> dict[str, object]:
+    img: dict[str, object] = {}
+    cmac_r = _gen_work_keycmac_once(kbpk, VersionId.E)
+    kbek, kbak = cmac_r.kbek, cmac_r.kbak
+    img["method"] = "cmac"
+    img["algorithm"] = Algorithm.AES
+    img["subkey_name"] = cmac_r.subkey_name
+    img["subkey"] = cmac_r.subkey
+    img["kbek"] = kbek
+    img["kbak"] = kbak
+    img["cmac_passes"] = cmac_r.passes
+
+    clear_key_data, pad_len, total_pad, key_len_bits, padding = _wrapv_clear_key(
+        key, extra_pad, 0, padding_mode,
+    )
+    img["key_len_bits"] = key_len_bits
+    img["pad_len"] = pad_len
+    img["total_pad"] = total_pad
+    img["clear_key_data"] = clear_key_data
+
+    k1, k2 = psec.tr31.KeyBlock(kbpk=b"\x00" * 16)._derive_aes_cmac_subkey(kbak)
+    mac_data_full = header_dump.encode("ascii") + clear_key_data
+    if len(mac_data_full) % 16 == 0:
+        mac_data_xor = mac_data_full[:-16] + psec.tools.xor(mac_data_full[-16:], k1)
+        img["mac_padded"] = False
+    else:
+        padded = psec.mac.pad_iso_2(mac_data_full, 16)
+        mac_data_xor = padded[:-16] + psec.tools.xor(padded[-16:], k2)
+        img["mac_padded"] = True
+    mac = psec.mac.generate_cbc_mac(kbak, mac_data_xor, 1, 16, psec.mac.Algorithm.AES)
+    img["mac_k1"] = k1
+    img["mac_k2"] = k2
+    img["mac_data_full"] = mac_data_full
+    img["mac_data_xor"] = mac_data_xor
+    img["mac"] = mac
+
+    enc_key = psec.aes.encrypt_aes_ctr(kbek, mac, clear_key_data)
+    img["nonce"] = mac
+    img["enc_key"] = enc_key
+
+    img["key_block"] = header_dump + enc_key.hex().upper() + mac.hex().upper()
+    return img
+
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+
+_WRAPV_DISPATCH: dict[str, Callable] = {
+    "A": _wrapv_ac, "C": _wrapv_ac,
+    "B": _wrapv_b, "D": _wrapv_d, "E": _wrapv_e,
+}
+
+_VERSION_LABELS: dict[str, str] = {
+    "A": "TDES variant (deprecated)",
+    "B": "TDES CMAC key derivation (preferred)",
+    "C": "TDES variant (same as A)",
+    "D": "AES CMAC key derivation",
+    "E": "AES CMAC key derivation (ISO 20038, CTR)",
+}
+
+_ALGO_MAX_KEY_LEN: dict[str, int] = {"T": 24, "D": 24, "A": 32}
+
+
+def do_tr31_wrap_verbose(
+    kbpk: bytes, header_str: str, key: bytes,
+    masked_key_len: int | None = None,
+    padding_mode: str = "zero",
+) -> tuple[str, dict[str, object]]:
+    hdr = psec.tr31.Header()
+    hdr.load(header_str)
+    ver = hdr.version_id
+    if ver not in _WRAPV_DISPATCH:
+        raise ValueError(f"wrap-verbose does not support version '{ver}'")
+    img: dict[str, object] = {}
+    img["version_id"] = ver
+    img["padding_mode"] = padding_mode
+
+    if masked_key_len is None:
+        masked_key_len = max(_ALGO_MAX_KEY_LEN.get(hdr.algorithm, len(key)), len(key))
+    else:
+        masked_key_len = max(masked_key_len, len(key))
+    extra_pad = masked_key_len - len(key)
+    img["masked_key_len"] = masked_key_len
+    img["extra_pad"] = extra_pad
+
+    header_dump = _wrapv_build_header(hdr, masked_key_len)
+    img["header_dump"] = header_dump
+
+    inner = _WRAPV_DISPATCH[ver](kbpk, header_dump, key, extra_pad, padding_mode)
+    img.update(inner)
+
+    return img["key_block"], img
+
+
+def cmd_tr31_wrap_verbose(args: argparse.Namespace) -> None:
+    kbpk = bytes.fromhex(args.kbpk)
+    key = bytes.fromhex(args.key)
+
+    try:
+        key_block, img = do_tr31_wrap_verbose(
+            kbpk, args.header, key, args.masked_key_len, args.padding,
+        )
+    except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    ver = img["version_id"]
+    label = _VERSION_LABELS.get(ver, "unknown")
+    print(f"=== TR-31 Version {ver} Key Wrap ({label}) ===\n")
+
+    print("--- Inputs ---")
+    print(f"KBPK:              {kbpk.hex().upper()} ({len(kbpk)} bytes)")
+    print(f"Header (input):    {args.header}")
+    print(f"Key:               {key.hex().upper()} ({len(key)} bytes)")
+    ml = img["masked_key_len"]
+    default_note = f"  (default: max({_ALGO_MAX_KEY_LEN.get(ver, '?')}, {len(key)}))" if args.masked_key_len is None else ""
+    print(f"Masked key len:    {ml} bytes{default_note}")
+    pm = img.get("padding_mode", "zero")
+    print(f"Padding mode:      {pm} ({'os.urandom' if pm == 'random' else 'zero-fill'})")
+    print()
+
+    hdr_tmp = psec.tr31.Header()
+    hdr_tmp.load(args.header)
+    print("--- Parsed Header Fields ---")
+    print(f"version_id:        {hdr_tmp.version_id}")
+    print(f"key_usage:         {hdr_tmp.key_usage}")
+    print(f"algorithm:         {hdr_tmp.algorithm}")
+    print(f"mode_of_use:       {hdr_tmp.mode_of_use}")
+    print(f"version_num:       {hdr_tmp.version_num}")
+    print(f"exportability:     {hdr_tmp.exportability}")
+    print(f"reserved:          {hdr_tmp.reserved}")
+    if hdr_tmp.blocks:
+        print(f"optional blocks:   {len(hdr_tmp.blocks)}")
+        for bid, bdata in hdr_tmp.blocks.items():
+            print(f"  {bid}: {bdata}")
+    print()
+
+    print("--- Header String (dump) ---")
+    print(f"  {img['header_dump']}")
+    print()
+
+    # --- Key derivation ---
+    method = img.get("method")
+    if method == "variant":
+        print("--- Key Derivation (variant) ---")
+        print(f"KBPK:              {kbpk.hex().upper()}")
+        print(f"variant_enc (0x45): {img['variant_enc'].hex().upper()}")
+        print(f"  => KBEK (XOR):   {img['kbek'].hex().upper()}")
+        print(f"variant_mac (0x4D): {img['variant_mac'].hex().upper()}")
+        print(f"  => KBAK (XOR):   {img['kbak'].hex().upper()}")
+        print()
+    elif method == "cmac":
+        algo = img["algorithm"]
+        print(f"--- Key Derivation (CMAC, {algo}) ---")
+        print(f"KBPK:              {kbpk.hex().upper()}")
+        subkey_name = img["subkey_name"]
+        print(f"CMAC subkey ({subkey_name}): {img['subkey'].hex().upper()}")
+        for usage_label in ("enc", "mac"):
+            for i, p in enumerate(img["cmac_passes"][usage_label], 1):
+                print(f"  kd[{i}]{usage_label}: {p['xor'].hex().upper()}  --CMAC--> {p['cmac'].hex().upper()}")
+        print(f"  => KBEK:         {img['kbek'].hex().upper()}")
+        print(f"  => KBAK:         {img['kbak'].hex().upper()}")
+        print()
+    else:
+        print("--- Key Derivation ---")
+        print(f"KBEK:              {img['kbek'].hex().upper()}")
+        print(f"KBAK:              {img['kbak'].hex().upper()}")
+        print()
+
+    # --- Clear key data ---
+    print("--- Clear Key Data ---")
+    print(f"key_len_bits:      {img['key_len_bits'].hex().upper()}  "
+          f"({int.from_bytes(img['key_len_bits'], 'big')} bits = {len(key)} bytes)")
+    print(f"key (payload):     {key.hex().upper()}  ({len(key)} bytes)")
+    print(f"extra_pad:         {img['extra_pad']} bytes  (length masking)")
+    print(f"pad_len:           {img['pad_len']} bytes  (block alignment)")
+    total_pad = img["total_pad"]
+    print(f"total_pad:         {total_pad} bytes")
+    if total_pad > 0:
+        print(f"padding:           {'00' * total_pad}")
+    else:
+        print(f"padding:           (none)")
+    print(f"clear_key_data:    {img['clear_key_data'].hex().upper()}  "
+          f"({len(img['clear_key_data'])} bytes)")
+    print()
+
+    # --- Encryption ---
+    if ver in ("A", "C", "B"):
+        cipher = "TDES-CBC"
+    elif ver == "D":
+        cipher = "AES-CBC"
+    else:
+        cipher = "AES-CTR"
+    print(f"--- Encryption ({cipher}) ---")
+    print(f"KBEK:              {img['kbek'].hex().upper()}")
+    if ver in ("A", "C"):
+        iv_str = img["iv"].decode("ascii")
+        print(f"IV (header[:8]):   {img['iv'].hex().upper()}  (= \"{iv_str}\")")
+    elif ver == "E":
+        print(f"Nonce (MAC):       {img['nonce'].hex().upper()}")
+    else:
+        print(f"IV (MAC):          {img['iv_mac'].hex().upper()}")
+    print(f"clear_key_data:    {img['clear_key_data'].hex().upper()}")
+    print(f"enc_key:           {img['enc_key'].hex().upper()}  "
+          f"({len(img['enc_key'])} bytes)")
+    print()
+
+    # --- MAC ---
+    print("--- MAC Generation ---")
+    print(f"KBAK:              {img['kbak'].hex().upper()}")
+    if ver in ("A", "C"):
+        print(f"MAC input:         header (ascii) + enc_key (bytes)")
+        print(f"  header (ascii):  {img['header_dump']}")
+        print(f"  + enc_key (hex): {img['enc_key'].hex().upper()}")
+        print(f"  = MAC data:      {img['mac_data_bytes'].hex().upper()}")
+        print(f"CBC-MAC:           MAC = CBC-MAC(KBAK, MAC data, padding=1, len=4, DES)")
+        mac_len = 4
+    elif ver == "B":
+        print(f"CMAC K1 of KBAK:   {img['mac_k1'].hex().upper()}")
+        print(f"MAC data:          header || clear_key_data")
+        print(f"  header:          {img['header_dump']}")
+        print(f"  + ckd (hex):     {img['clear_key_data'].hex().upper()}")
+        print(f"  = full:          {img['mac_data_full'].hex().upper()}")
+        print(f"  XOR last 8:      {img['mac_data_xor'].hex().upper()}")
+        print(f"CBC-MAC:           MAC = CBC-MAC(KBAK, xor_data, padding=1, len=8, DES)")
+        mac_len = 8
+    elif ver == "D":
+        print(f"CMAC K1 of KBAK:   {img['mac_k1'].hex().upper()}")
+        print(f"MAC data:          header || clear_key_data")
+        print(f"  header:          {img['header_dump']}")
+        print(f"  + ckd (hex):     {img['clear_key_data'].hex().upper()}")
+        print(f"  = full:          {img['mac_data_full'].hex().upper()}")
+        print(f"  XOR last 16:     {img['mac_data_xor'].hex().upper()}")
+        print(f"CBC-MAC:           MAC = CBC-MAC(KBAK, xor_data, padding=1, len=16, AES)")
+        mac_len = 16
+    else:
+        padded_note = " (padded)" if img.get("mac_padded") else " (exact block)"
+        print(f"CMAC K1 of KBAK:   {img['mac_k1'].hex().upper()}")
+        print(f"CMAC K2 of KBAK:   {img['mac_k2'].hex().upper()}")
+        print(f"MAC data:          header || clear_key_data")
+        print(f"  header:          {img['header_dump']}")
+        print(f"  + ckd (hex):     {img['clear_key_data'].hex().upper()}")
+        print(f"  = full:          {img['mac_data_full'].hex().upper()}{padded_note}")
+        print(f"  XOR last 16:     {img['mac_data_xor'].hex().upper()}")
+        print(f"CBC-MAC:           MAC = CBC-MAC(KBAK, xor_data, padding=1, len=16, AES)")
+        mac_len = 16
+    print(f"MAC:               {img['mac'].hex().upper()}  ({mac_len} bytes)")
+    print()
+
+    print("--- Final Key Block ---")
+    print(f"  {img['key_block']}")
+    print()
+
+    try:
+        lib_kb = psec.tr31.wrap(
+            kbpk=kbpk, header=args.header, key=key,
+            masked_key_len=args.masked_key_len,
+        )
+        print("--- Cross-check ---")
+        print(f"Library wrap:      {lib_kb}")
+
+        kb_obj = psec.tr31.KeyBlock(kbpk=kbpk)
+        try:
+            unwrapped = kb_obj.unwrap(img["key_block"])
+            ok_self = "OK" if unwrapped == key else "MISMATCH"
+            print(f"Self-unwrap:       {unwrapped.hex().upper()}  ({ok_self})")
+        except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
+            print(f"Self-unwrap:       FAILED  ({e})")
+
+        kb_obj2 = psec.tr31.KeyBlock(kbpk=kbpk)
+        try:
+            lib_unwrapped = kb_obj2.unwrap(lib_kb)
+            ok_lib = "OK" if lib_unwrapped == key else "MISMATCH"
+            print(f"Library-unwrap:    {lib_unwrapped.hex().upper()}  ({ok_lib})")
+        except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
+            print(f"Library-unwrap:    FAILED  ({e})")
+    except (psec.tr31.KeyBlockError, psec.tr31.HeaderError, ValueError) as e:
+        print(f"Library wrap: n/a  ({e})")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1125,6 +1582,20 @@ def build_parser() -> argparse.ArgumentParser:
     kbek_kbak = tr31_sub.add_parser("kbek-kbak", help="Manual KBEK/KBAK derivation with library comparison.")
     kbek_kbak.add_argument("-k", "--kbpk", required=True, help="Key Block Protection Key as a hex string.")
     kbek_kbak.set_defaults(func=cmd_tr31_kbek_kbak)
+
+    wrapv = tr31_sub.add_parser("wrap-verbose", help="Verbose TR-31 key wrap with all intermediate values (versions A-E).")
+    wrapv.add_argument("-k", "--kbpk", required=True, help="Key Block Protection Key as a hex string.")
+    wrapv.add_argument("header", help="TR-31 key block header string.")
+    wrapv.add_argument("key", help="Key to wrap as a hex string.")
+    wrapv.add_argument(
+        "-m", "--masked-key-len", type=int, default=None,
+        help="Desired key length in bytes to mask true key length.",
+    )
+    wrapv.add_argument(
+        "--padding", default="zero", choices=["zero", "random"],
+        help="Padding style: zero (deterministic 0x00 fill) or random (os.urandom, matches library).",
+    )
+    wrapv.set_defaults(func=cmd_tr31_wrap_verbose)
 
     return parser
 
